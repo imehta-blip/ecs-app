@@ -277,16 +277,25 @@ class GooglePollenClient:
         except urllib.error.URLError as e:
             raise RuntimeError(f"Network error reaching Google Pollen API: {e.reason}")
 
-        # Parse response — Google returns dailyInfo list
+        # Parse response
+        # IMPORTANT: Google has TWO arrays in dailyInfo:
+        #   - pollenTypeInfo: aggregated TREE / GRASS / WEED  <-- this is what we need
+        #   - plantInfo / plantsInfo: individual species (BIRCH, OAK, etc.) <-- NOT used here
+        # The original code read from plantInfo which never contains TREE/GRASS/WEED codes,
+        # causing pollen to always return 0.
         daily = data.get("dailyInfo", [{}])[0]
-        plant_info = {p["code"]: p for p in daily.get("plantInfo", [])}
+        pollen_type_info = {p["code"]: p for p in daily.get("pollenTypeInfo", [])}
 
         def index_value(code, pollen_map):
-            plant = plant_info.get(code, {})
-            idx = plant.get("indexInfo", {}).get("value", 0)
-            return pollen_map.get(int(idx), 0)
+            entry = pollen_type_info.get(code, {})
+            # indexInfo is omitted entirely when plant is out of season — default to 0
+            idx = entry.get("indexInfo", {}).get("value", 0)
+            try:
+                return pollen_map.get(int(idx), 0)
+            except (TypeError, ValueError):
+                return 0
 
-        # Google codes: TREE, GRASS, WEED (aggregated categories)
+        # Google codes in pollenTypeInfo: TREE, GRASS, WEED
         return {
             "pollen_tree":  index_value("TREE",  self.TREE_GRASS_MAP),
             "pollen_grass": index_value("GRASS", self.TREE_GRASS_MAP),
