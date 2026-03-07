@@ -660,45 +660,70 @@ if result is not None:
 
         rows = ""
         for key, final_val in sorted(assembly.pollutants.items()):
-            name     = DISPLAY_NAMES.get(key, key)
-            unit     = DISPLAY_UNITS.get(key, "")
-            outdoor  = assembly.outdoor_raw.get(key) or assembly.pollen_raw.get(key)
-            factor   = INFILTRATION_FACTORS.get(key)
-            who      = WHO_THRESHOLDS.get(key)
-            if isinstance(who, tuple): who = who[0]  # some thresholds are tuples
+            name    = DISPLAY_NAMES.get(key, key)
+            unit    = DISPLAY_UNITS.get(key, "")
+            # outdoor_raw holds AQ pollutants; pollen_raw holds pollen — check both
+            outdoor = assembly.outdoor_raw.get(key) if assembly.outdoor_raw.get(key) is not None \
+                      else assembly.pollen_raw.get(key)
+            factor  = INFILTRATION_FACTORS.get(key)
+            who     = WHO_THRESHOLDS.get(key)
+            if isinstance(who, tuple): who = who[0]
 
-            above = who is not None and final_val > who
+            # For WHO comparison: use outdoor raw for pollen when indoors
+            # (pollen is heavily attenuated indoors by ×0.10, but the health risk
+            #  is from what you were exposed to outdoors — flag if outdoor raw is high)
+            compare_val = final_val
+            if is_indoor and outdoor is not None and key in ("pollen_tree", "pollen_grass", "pollen_weed"):
+                compare_val = outdoor
 
+            above   = who is not None and compare_val > who
             css_val = "above-who" if above else "below-who"
             who_str = f"{who}" if who is not None else "—"
 
-            if is_indoor and outdoor is not None and factor is not None:
+            # Always show the outdoor raw number — it tells the user what the real exposure was
+            if outdoor is not None:
                 outdoor_str = f"{outdoor}"
-                factor_str  = f"×{factor}"
             else:
                 outdoor_str = "—"
-                factor_str  = "—"
+
+            # Infiltration factor — only meaningful indoors
+            if is_indoor and factor is not None and outdoor is not None:
+                engine_str = f"{final_val}  <span style='color:#555;font-size:11px'>(×{factor})</span>"
+            else:
+                engine_str = f"{final_val}"
+
+            # Status badge
+            if above:
+                badge = "⚠ HIGH"
+                badge_css = "color:#ff6b6b;font-weight:700;font-size:11px"
+            else:
+                badge = "OK"
+                badge_css = "color:#51cf66;font-size:11px"
 
             rows += f"""
 <tr>
   <td>{name}</td>
-  <td class="{css_val}">{final_val}</td>
   <td style="color:#888">{outdoor_str}</td>
-  <td style="color:#666">{factor_str}</td>
+  <td>{engine_str}</td>
+  <td style="{badge_css}">{badge}</td>
   <td style="color:#555">{who_str}</td>
   <td style="color:#555">{unit}</td>
 </tr>"""
 
-        header_outdoor = "Outdoor raw" if is_indoor else "—"
-        header_factor  = "Infiltration" if is_indoor else "—"
+        # Column headers depend on zone
+        col2_header = "Outdoor raw" if is_indoor else "Value"
+        col3_header = "Indoor (infiltrated)" if is_indoor else "—"
 
         st.markdown(f"""
 <table class="poll-table">
   <thead>
     <tr>
-      <th>Pollutant</th><th>Value</th>
-      <th>{header_outdoor}</th><th>{header_factor}</th>
-      <th>WHO limit</th><th>Unit</th>
+      <th>Pollutant</th>
+      <th>{col2_header}</th>
+      <th>{col3_header}</th>
+      <th>Status</th>
+      <th>WHO limit</th>
+      <th>Unit</th>
     </tr>
   </thead>
   <tbody>{rows}</tbody>
@@ -708,9 +733,40 @@ if result is not None:
         if is_indoor:
             st.markdown(
                 f"<small style='color:#555'>Zone: **{assembly.zone.value.upper()}** (indoor) · "
-                f"PM2.5 source: `{assembly.pm25_source}`</small>",
+                f"PM2.5 source: `{assembly.pm25_source}` · "
+                f"Pollen WHO check uses outdoor raw (indoor pollen ×0.10 is not the exposure risk)</small>",
                 unsafe_allow_html=True,
             )
+
+        # ── Backend inspector ─────────────────────────────────────────────────
+        with st.expander("🔬 Backend — raw data & assembly log"):
+            st.markdown("**Outdoor API (raw)**")
+            raw_cols = st.columns(len(assembly.outdoor_raw))
+            for i, (k, v) in enumerate(assembly.outdoor_raw.items()):
+                raw_cols[i].metric(DISPLAY_NAMES.get(k, k), f"{v}", help=f"{DISPLAY_UNITS.get(k,'')}")
+
+            st.markdown("**Pollen API (raw)**")
+            pol_cols = st.columns(len(assembly.pollen_raw))
+            for i, (k, v) in enumerate(assembly.pollen_raw.items()):
+                who_p = WHO_THRESHOLDS.get(k, "?")
+                pol_cols[i].metric(
+                    DISPLAY_NAMES.get(k, k),
+                    f"{v}",
+                    delta=f"WHO limit: {who_p}",
+                    delta_color="off",
+                    help=f"{DISPLAY_UNITS.get(k,'')}"
+                )
+
+            if assembly.source_notes:
+                st.markdown("**Assembly log** — how every number was built")
+                for note in assembly.source_notes:
+                    st.markdown(f"`{note}`")
+
+            if assembly.missing_outdoor:
+                st.warning(f"Possible API gaps (returned 0): {', '.join(assembly.missing_outdoor)}")
+
+            st.markdown("**Full pollutants dict sent to engine**")
+            st.json(assembly.pollutants)
 
 
 # ── History chart ─────────────────────────────────────────────────────────────
