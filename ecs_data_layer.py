@@ -1,0 +1,544 @@
+"""
+ECS Data Layer
+==============
+Fetches real outdoor air quality and pollen data and assembles
+the pollutants dict the ECS Engine expects.
+
+THREE COMPONENTS:
+  1. OpenWeatherMapClient  — outdoor AQ: pm25, pm10, no2, o3, co
+  2. GooglePollenClient    — pollen: tree, grass, weed
+  3. PollutantAssembler    — combines outdoor + indoor sources based on
+                             location zone, applying infiltration factors
+                             when the person is indoors.
+
+LOCATION LOGIC:
+  OUTDOOR / COMMUTE zone → outdoor API values only — PM2.5, PM10, NO2, O3,
+                           CO, pollen. No indoor pollutants.
+  HOME / WORK zone       → ALL outdoor pollutants × infiltration factor
+                           (PM2.5, PM10, NO2, O3, CO, pollen all infiltrated)
+                           If indoor PM2.5 sensor provided, its reading ADDS
+                           to infiltrated outdoor PM2.5 (does not replace it)
+                           CO2, radon, humidity, temp from manual overrides
+
+INFILTRATION FACTORS (I/O ratios from building science literature):
+  PM2.5:  0.50  Fine particles pass through gaps and ventilation
+                (+ indoor sensor reading if provided — both stack)
+  PM10:   0.30  Coarser particles filtered more by building envelope
+  NO2:    0.60  Gas — penetrates well through ventilation
+  O3:     0.20  Reacts with surfaces, degrades quickly indoors
+  CO:     0.70  Gas — penetrates freely
+  Pollen: 0.10  Large particles, mostly blocked by windows/doors
+
+Sources:
+  Nazaroff 2004 — Inhalation exposure to particles indoors
+  Chen & Zhao 2011 — Review of I/O ratios for urban residential
+  WHO 2010 — WHO guidelines for indoor air quality
+
+USAGE:
+  owm    = OpenWeatherMapClient(api_key="YOUR_OWM_KEY")
+  pollen = GooglePollenClient(api_key="YOUR_GOOGLE_KEY")
+  assembler = PollutantAssembler(owm_client=owm, pollen_client=pollen)
+
+  # One call — returns engine-ready dict
+  pollutants = assembler.get(
+      lat=51.5074, lon=-0.1278,
+      zone=LocationZone.HOME,
+      indoor_overrides={
+          "pm25":     12.0,  # indoor PM2.5 sensor (stacks with outdoor infiltration)
+          "co2":       820,  # manual until CO2 sensor arrives
+          "radon":      50,  # manual
+          "humidity":   50,  # manual
+          "temp":       21,  # manual
+      }
+  )
+"""
+
+import urllib.request
+import urllib.parse
+import urllib.error
+import json
+import datetime
+from dataclasses import dataclass, field
+from typing import Optional, Dict
+from enum import Enum
+
+
+# ── Location zone enum (mirrors agent) ───────────────────────────────────────
+
+class LocationZone(Enum):
+    HOME    = "home"
+    WORK    = "work"
+    COMMUTE = "commute"
+    OUTDOOR = "outdoor"
+    UNKNOWN = "unknown"
+
+INDOOR_ZONES  = {LocationZone.HOME, LocationZone.WORK}
+OUTDOOR_ZONES = {LocationZone.COMMUTE, LocationZone.OUTDOOR, LocationZone.UNKNOWN}
+
+
+# ── Infiltration factors ──────────────────────────────────────────────────────
+
+# Infiltration factors applied to ALL outdoor pollutants when indoors.
+# PM2.5 uses 0.50 infiltration AND stacks with any indoor sensor reading.
+INFILTRATION_FACTORS = {
+    "pm25":         0.50,  # fine particles pass through gaps and ventilation
+    "pm10":         0.30,  # coarser particles filtered more by building envelope
+    "no2":          0.60,  # gas — penetrates well through ventilation
+    "o3":           0.20,  # reacts with surfaces, degrades quickly indoors
+    "co":           0.70,  # gas — penetrates freely
+    "pollen_tree":  0.10,  # large particles, mostly blocked by windows/doors
+    "pollen_grass": 0.10,
+    "pollen_weed":  0.10,
+}
+
+# Indoor-only pollutants — only present when indoors.
+# pm25 is listed here because indoors it comes from the sensor, not the API.
+INDOOR_ONLY_POLLUTANTS = {"co2", "radon", "humidity", "temp"}
+
+# Pollutants supplied by indoor sensor (replaces outdoor API value when indoors)
+INDOOR_SENSOR_POLLUTANTS = {"pm25"}
+
+# Outdoor-only pollutants — only scored when outdoors
+OUTDOOR_ONLY_POLLUTANTS = {"pollen_tree", "pollen_grass", "pollen_weed"}
+
+# Default indoor values used when user has no sensor and no manual override
+DEFAULT_INDOOR_OVERRIDES = {
+    "co2":      800,   # ppm — typical occupied room
+    "radon":     50,   # Bq/m³ — conservative default
+    "humidity":  50,   # % RH
+    "temp":      21,   # °C
+    # pm25 not defaulted here — uses INFILTRATION_FACTORS['pm25'] when no sensor provided
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. OpenWeatherMap Air Pollution Client
+# ══════════════════════════════════════════════════════════════════════════════
+
+class OpenWeatherMapClient:
+    """
+    Fetches current outdoor air quality from OpenWeatherMap Air Pollution API.
+    Returns: pm25, pm10, no2, o3, co as a dict with engine-compatible keys.
+
+    API docs: https://openweathermap.org/api/air-pollution
+    Free tier: 60 calls/minute, no daily cap.
+    """
+
+    BASE_URL = "http://api.openweathermap.org/data/2.5/air_pollution"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def fetch(self, lat: float, lon: float) -> dict:
+        """
+        Fetch current outdoor AQ for a GPS location.
+
+        Returns a dict with keys: pm25, pm10, no2, o3, co
+        All values in engine-compatible units (µg/m³ or mg/m³).
+
+        Raises:
+            ValueError  if API key is the placeholder string
+            RuntimeError if API call fails
+        """
+        if self.api_key in ("YOUR_OWM_KEY", "", None):
+            raise ValueError(
+                "OpenWeatherMap API key not set. "
+                "See Section 1 of the notebook for setup instructions."
+            )
+
+        url = (
+            f"{self.BASE_URL}"
+            f"?lat={lat}&lon={lon}&appid={self.api_key}"
+        )
+
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise RuntimeError(
+                    "OpenWeatherMap API key rejected (401). "
+                    "Check your key is correct and activated."
+                )
+            raise RuntimeError(f"OpenWeatherMap API error {e.code}: {e.reason}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Network error reaching OpenWeatherMap: {e.reason}")
+
+        # OWM returns components in µg/m³ for particles, µg/m³ for gases
+        # CO is returned in µg/m³ — engine expects mg/m³, so divide by 1000
+        components = data["list"][0]["components"]
+
+        return {
+            "pm25": round(components.get("pm2_5", 0.0), 2),
+            "pm10": round(components.get("pm10",  0.0), 2),
+            "no2":  round(components.get("no2",   0.0), 2),
+            "o3":   round(components.get("o3",    0.0), 2),
+            "co":   round(components.get("co",    0.0) / 1000.0, 3),  # µg/m³ → mg/m³
+        }
+
+    def fetch_forecast(self, lat: float, lon: float, hours: int = 24) -> list:
+        """
+        Fetch hourly AQ forecast for the next N hours.
+        Returns list of dicts with keys: timestamp, pm25, pm10, no2, o3, co
+        """
+        if self.api_key in ("YOUR_OWM_KEY", "", None):
+            raise ValueError("OpenWeatherMap API key not set.")
+
+        url = (
+            f"http://api.openweathermap.org/data/2.5/air_pollution/forecast"
+            f"?lat={lat}&lon={lon}&appid={self.api_key}"
+        )
+
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as e:
+            raise RuntimeError(f"OpenWeatherMap forecast error: {e}")
+
+        results = []
+        for entry in data["list"][:hours]:
+            c = entry["components"]
+            results.append({
+                "timestamp": entry["dt"],
+                "pm25": round(c.get("pm2_5", 0.0), 2),
+                "pm10": round(c.get("pm10",  0.0), 2),
+                "no2":  round(c.get("no2",   0.0), 2),
+                "o3":   round(c.get("o3",    0.0), 2),
+                "co":   round(c.get("co",    0.0) / 1000.0, 3),
+            })
+        return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. Google Pollen Client
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GooglePollenClient:
+    """
+    Fetches daily pollen forecast from Google Pollen API.
+    Returns: pollen_tree, pollen_grass, pollen_weed as grains/m³ equivalents.
+
+    API docs: https://developers.google.com/maps/documentation/pollen/overview
+    Note: Google Pollen API returns an index (0-5) not grains/m³.
+    We map the index to approximate grains/m³ using WHO reference ranges
+    so the engine can apply its thresholds consistently.
+
+    Index → grains/m³ mapping (conservative midpoints):
+      0 (None)    →   0
+      1 (Very Low)→   5
+      2 (Low)     →  20
+      3 (Moderate)→  50   ← WHO tree/grass threshold
+      4 (High)    → 100
+      5 (Very High)→ 200
+
+    For weed pollen (WHO limit = 10 grains/m³), the mapping is tighter:
+      0 → 0, 1 → 2, 2 → 5, 3 → 10, 4 → 20, 5 → 50
+    """
+
+    BASE_URL = "https://pollen.googleapis.com/v1/forecast:lookup"
+
+    # Index → approximate grains/m³ for tree and grass pollen
+    TREE_GRASS_MAP = {0: 0, 1: 5, 2: 20, 3: 50, 4: 100, 5: 200}
+    # Index → approximate grains/m³ for weed pollen (lower WHO threshold)
+    WEED_MAP       = {0: 0, 1: 2, 2: 5,  3: 10, 4: 20,  5: 50}
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def fetch(self, lat: float, lon: float) -> dict:
+        """
+        Fetch today's pollen forecast for a GPS location.
+        Returns: {pollen_tree, pollen_grass, pollen_weed}
+        """
+        if self.api_key in ("YOUR_GOOGLE_KEY", "", None):
+            raise ValueError(
+                "Google API key not set. "
+                "See Section 1 of the notebook for setup instructions."
+            )
+
+        params = urllib.parse.urlencode({
+            "key":      self.api_key,
+            "location.longitude": lon,
+            "location.latitude":  lat,
+            "days":     1,
+        })
+        url = f"{self.BASE_URL}?{params}"
+
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                raise RuntimeError(
+                    "Google Pollen API key rejected (403). "
+                    "Check the key has Pollen API enabled in Google Cloud Console."
+                )
+            raise RuntimeError(f"Google Pollen API error {e.code}: {e.reason}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Network error reaching Google Pollen API: {e.reason}")
+
+        # Parse response — Google returns dailyInfo list
+        daily = data.get("dailyInfo", [{}])[0]
+        plant_info = {p["code"]: p for p in daily.get("plantInfo", [])}
+
+        def index_value(code, pollen_map):
+            plant = plant_info.get(code, {})
+            idx = plant.get("indexInfo", {}).get("value", 0)
+            return pollen_map.get(int(idx), 0)
+
+        # Google codes: TREE, GRASS, WEED (aggregated categories)
+        return {
+            "pollen_tree":  index_value("TREE",  self.TREE_GRASS_MAP),
+            "pollen_grass": index_value("GRASS", self.TREE_GRASS_MAP),
+            "pollen_weed":  index_value("WEED",  self.WEED_MAP),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. Pollutant Assembler
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class AssemblerResult:
+    """
+    Full assembled pollutants dict plus metadata about how it was built.
+    """
+    pollutants:       dict           # engine-ready dict
+    zone:             LocationZone
+    is_indoor:        bool
+    outdoor_raw:      dict           # raw outdoor API values (before infiltration)
+    pollen_raw:       dict           # raw pollen values (before infiltration)
+    indoor_overrides: dict           # manual/sensor indoor values that were applied
+    infiltrated:      dict           # outdoor values after infiltration factor
+    pm25_source:      str            # "sensor_plus_infiltration" | "infiltration_only" | "outdoor_api"
+    missing_outdoor:  list           # pollutants that defaulted to 0 (API gap)
+    source_notes:     list           # human-readable explanation of each value's source
+
+
+class PollutantAssembler:
+    """
+    Combines outdoor AQ + pollen + indoor overrides into the pollutants dict
+    the ECS Engine expects. Applies infiltration factors when indoors.
+
+    Usage:
+        assembler = PollutantAssembler(owm_client, pollen_client)
+        result = assembler.get(
+            lat=51.5074, lon=-0.1278,
+            zone=LocationZone.HOME,
+            indoor_overrides={"co2": 820, "radon": 50, "humidity": 50, "temp": 21}
+        )
+        # Pass result.pollutants to HourlyReading(pollutants=...)
+    """
+
+    def __init__(self,
+                 owm_client: OpenWeatherMapClient,
+                 pollen_client: GooglePollenClient):
+        self.owm    = owm_client
+        self.pollen = pollen_client
+
+    def get(self,
+            lat: float,
+            lon: float,
+            zone: LocationZone,
+            indoor_overrides: Optional[Dict] = None) -> AssemblerResult:
+        """
+        Fetch and assemble all pollutants for the given location and zone.
+
+        Args:
+            lat, lon:         GPS coordinates
+            zone:             LocationZone — determines indoor vs outdoor logic
+            indoor_overrides: Dict of manual/sensor indoor values.
+                              For HOME/WORK:
+                                "pm25"     — from indoor PM2.5 sensor (replaces outdoor)
+                                "co2"      — from CO2 sensor or manual
+                                "radon"    — manual
+                                "humidity" — manual
+                                "temp"     — manual
+                              Defaults applied for any missing keys except pm25
+                              (pm25 falls back to outdoor × 0.50 if not provided).
+        """
+        # Compare by value string, not enum identity.
+        # When ecs_data_layer and ecs_agent are both exec'd into the same
+        # Colab namespace, they each define their own LocationZone class.
+        # The `in` set check uses object identity and fails across classes.
+        # Using .value (a plain string) is identity-independent.
+        _zone_val = zone.value if hasattr(zone, 'value') else str(zone)
+        is_indoor = _zone_val in {z.value for z in INDOOR_ZONES}
+        overrides = dict(DEFAULT_INDOOR_OVERRIDES)
+        if indoor_overrides:
+            overrides.update(indoor_overrides)
+
+        # ── Fetch outdoor data ────────────────────────────────────────────────
+        outdoor_raw  = self.owm.fetch(lat, lon)
+        pollen_raw   = self.pollen.fetch(lat, lon)
+        outdoor_full = {**outdoor_raw, **pollen_raw}
+
+        # ── Build pollutants dict ─────────────────────────────────────────────
+        pollutants   = {}
+        infiltrated  = {}
+        missing      = []
+        source_notes = []
+        pm25_source  = "outdoor_api"
+
+        if is_indoor:
+            # ── PM2.5: sensor reading + outdoor infiltration both stack ───────
+            # The sensor measures particles already in the room.
+            # Outdoor PM2.5 continuously infiltrates on top — both contribute.
+            pm25_factor      = INFILTRATION_FACTORS["pm25"]
+            outdoor_pm25     = outdoor_full.get("pm25", 0.0)
+            infiltrated_pm25 = round(outdoor_pm25 * pm25_factor, 3)
+
+            if "pm25" in overrides and overrides["pm25"] is not None:
+                # Sensor reading + outdoor infiltration contribution (both stack)
+                sensor_pm25 = round(float(overrides["pm25"]), 3)
+                total_pm25  = round(sensor_pm25 + infiltrated_pm25, 3)
+                pollutants["pm25"]  = total_pm25
+                infiltrated["pm25"] = infiltrated_pm25
+                pm25_source = "sensor_plus_infiltration"
+                source_notes.append(
+                    f"pm25: {sensor_pm25} (indoor sensor) + {infiltrated_pm25} "
+                    f"(outdoor {outdoor_pm25} x {pm25_factor} infiltration)"
+                    f" = {total_pm25}"
+                )
+            else:
+                # No sensor — infiltration only
+                pollutants["pm25"]  = infiltrated_pm25
+                infiltrated["pm25"] = infiltrated_pm25
+                pm25_source = "infiltration_only"
+                source_notes.append(
+                    f"pm25: {outdoor_pm25} (outdoor) x {pm25_factor} "
+                    f"infiltration = {infiltrated_pm25}  "
+                    f"[no indoor sensor — add indoor_overrides['pm25'] to include sensor reading]"
+                )
+
+            # ── All other outdoor pollutants × infiltration factor ────────────
+            # pm25 is skipped — already handled above with sensor blending logic
+            for key, factor in INFILTRATION_FACTORS.items():
+                if key == "pm25":
+                    continue
+                raw = outdoor_full.get(key, 0.0)
+                val = round(raw * factor, 3)
+                infiltrated[key] = val
+                pollutants[key]  = val
+                source_notes.append(
+                    f"{key}: {raw} (outdoor) × {factor} infiltration = {val}"
+                )
+
+            # ── Indoor-only pollutants from manual overrides ──────────────────
+            for key in INDOOR_ONLY_POLLUTANTS:
+                val = overrides.get(key, DEFAULT_INDOOR_OVERRIDES.get(key, 0))
+                pollutants[key] = val
+                source_notes.append(f"{key}: {val} (manual indoor override)")
+
+            if "radon" not in pollutants:
+                pollutants["radon"] = overrides.get("radon", 50)
+
+        else:
+            # ── Outdoors — raw API values, no indoor pollutants ───────────────
+            for key in outdoor_full:
+                if key not in INDOOR_ONLY_POLLUTANTS:
+                    pollutants[key] = outdoor_full[key]
+                    source_notes.append(f"{key}: {outdoor_full[key]} (outdoor API)")
+
+            # Check for zero values that might be API gaps
+            for key in ["pm25", "pm10", "no2", "o3", "co"]:
+                if pollutants.get(key, 0) == 0:
+                    missing.append(key)
+
+        return AssemblerResult(
+            pollutants       = pollutants,
+            zone             = zone,
+            is_indoor        = is_indoor,
+            outdoor_raw      = outdoor_raw,
+            pollen_raw       = pollen_raw,
+            indoor_overrides = overrides if is_indoor else {},
+            infiltrated      = infiltrated,
+            pm25_source      = pm25_source,
+            missing_outdoor  = missing,
+            source_notes     = source_notes,
+        )
+
+    def print_assembly(self, result: AssemblerResult):
+        """Pretty-print the assembly result for debugging."""
+        zone_str = "INDOOR" if result.is_indoor else "OUTDOOR"
+        print(f"\n{'='*60}")
+        print(f"  POLLUTANT ASSEMBLY — {result.zone.value.upper()} ({zone_str})")
+        print(f"{'='*60}")
+        print(f"\n  Outdoor API (raw):")
+        for k, v in result.outdoor_raw.items():
+            print(f"    {k:<15} {v}")
+        print(f"\n  Pollen API (raw):")
+        for k, v in result.pollen_raw.items():
+            print(f"    {k:<15} {v}")
+        if result.is_indoor:
+            pm25_label = {
+                "sensor_plus_infiltration": "  <- sensor + outdoor infiltration blended",
+                "infiltration_only":        "  <- no sensor, outdoor x 0.50 only",
+                "outdoor_api":              "  <- outdoor only (not indoors)",
+            }.get(result.pm25_source, "")
+            print(f"\n  PM2.5 source: {result.pm25_source}{pm25_label}")
+            print(f"\n  Infiltrated outdoor pollutants (outdoor × factor):")
+            for k, v in result.infiltrated.items():
+                factor = INFILTRATION_FACTORS.get(k, 0.50)
+                print(f"    {k:<15} {v}  (×{factor})")
+            print(f"\n  Manual indoor overrides:")
+            shown = set()
+            for k in list(INDOOR_ONLY_POLLUTANTS) + ["radon"]:
+                if k not in shown:
+                    v = result.indoor_overrides.get(k, "—")
+                    print(f"    {k:<15} {v}")
+                    shown.add(k)
+            if result.pm25_source == "sensor_plus_infiltration":
+                outdoor_pm25 = result.outdoor_raw.get("pm25", 0.0)
+                infiltrated  = round(outdoor_pm25 * INFILTRATION_FACTORS["pm25"], 3)
+                sensor_val   = round(result.pollutants.get("pm25", 0.0) - infiltrated, 3)
+                print(f"\n  PM2.5 blend:")
+                print(f"    indoor sensor      {sensor_val}")
+                print(f"    outdoor infiltration {infiltrated}  ({outdoor_pm25} x {INFILTRATION_FACTORS['pm25']})")
+                print(f"    total (engine sees) {result.pollutants.get('pm25', 0.0)}")
+        print(f"\n  Final pollutants dict (engine input):")
+        for k, v in sorted(result.pollutants.items()):
+            print(f"    {k:<15} {v}")
+        if result.missing_outdoor:
+            print(f"\n  ⚠  Possible API gaps (returned 0): {result.missing_outdoor}")
+        print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. Mock client for testing without real API keys
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MockOWMClient:
+    """
+    Returns realistic outdoor AQ values without hitting the API.
+    Approximates a moderately polluted urban day (London/typical EU city).
+
+    Note: pm25 here is the OUTDOOR value. When indoors, the assembler
+    ignores this and uses the indoor sensor reading from indoor_overrides["pm25"].
+    """
+    def __init__(self):
+        self.api_key = "MOCK"
+
+    def fetch(self, lat: float, lon: float) -> dict:
+        return {"pm25": 18.5, "pm10": 32.0, "no2": 28.0, "o3": 65.0, "co": 0.42}
+
+    def fetch_forecast(self, lat: float, lon: float, hours: int = 24) -> list:
+        import time as _time
+        base = int(_time.time())
+        return [
+            {"timestamp": base + i*3600,
+             "pm25": 18.5, "pm10": 32.0, "no2": 28.0, "o3": 65.0, "co": 0.42}
+            for i in range(hours)
+        ]
+
+
+class MockPollenClient:
+    """
+    Returns moderate pollen values without hitting the API.
+    """
+    def __init__(self):
+        self.api_key = "MOCK"
+
+    def fetch(self, lat: float, lon: float) -> dict:
+        return {"pollen_tree": 45, "pollen_grass": 20, "pollen_weed": 5}
+
