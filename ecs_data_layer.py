@@ -101,13 +101,12 @@ INDOOR_SENSOR_POLLUTANTS = {"pm25"}
 # Outdoor-only pollutants — only scored when outdoors
 OUTDOOR_ONLY_POLLUTANTS = {"pollen_tree", "pollen_grass", "pollen_weed"}
 
-# Default indoor values used when user has no sensor and no manual override
+# Default indoor values — ONLY applied when an explicit sensor reading is passed in.
+# If no sensor reading is provided, these pollutants are NOT included in scoring.
+# We do not fabricate numbers we haven't measured.
 DEFAULT_INDOOR_OVERRIDES = {
-    "co2":      800,   # ppm — typical occupied room
-    "radon":     50,   # Bq/m³ — conservative default
-    "humidity":  50,   # % RH
-    "temp":      21,   # °C
-    # pm25 not defaulted here — uses INFILTRATION_FACTORS['pm25'] when no sensor provided
+    # No defaults. Radon, CO2, temp, humidity only scored when sensor data is provided.
+    # pm25 falls back to outdoor infiltration (outdoor_pm25 * 0.50) when no sensor.
 }
 
 
@@ -433,14 +432,14 @@ class PollutantAssembler:
                     f"{key}: {raw} (outdoor) × {factor} infiltration = {val}"
                 )
 
-            # ── Indoor-only pollutants from manual overrides ──────────────────
+            # ── Indoor-only pollutants — only if sensor data was passed in ─────
+            # We never fabricate radon, CO2, temp, or humidity.
+            # They are only included when explicitly provided in indoor_overrides.
             for key in INDOOR_ONLY_POLLUTANTS:
-                val = overrides.get(key, DEFAULT_INDOOR_OVERRIDES.get(key, 0))
-                pollutants[key] = val
-                source_notes.append(f"{key}: {val} (manual indoor override)")
-
-            if "radon" not in pollutants:
-                pollutants["radon"] = overrides.get("radon", 50)
+                if indoor_overrides and key in indoor_overrides and indoor_overrides[key] is not None:
+                    val = indoor_overrides[key]
+                    pollutants[key] = val
+                    source_notes.append(f"{key}: {val} (sensor reading)")
 
         else:
             # ── Outdoors — raw API values, no indoor pollutants ───────────────
