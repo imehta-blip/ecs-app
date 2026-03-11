@@ -6,6 +6,7 @@ Streamlit App
 import streamlit as st
 import streamlit.components.v1 as components
 import datetime
+import zoneinfo
 import json
 import sys
 import os
@@ -20,7 +21,7 @@ _ECS_COLAB_EXEC = True  # noqa: F841 — read by __main__ guards in engine/data 
 # pip install streamlit-js-eval
 # Without it the app falls back to the URL query-param GPS approach (button)
 try:
-    from streamlit_js_eval import get_geolocation
+    from streamlit_js_eval import get_geolocation, streamlit_js_eval
     _HAS_JS_EVAL = True
 except ImportError:
     _HAS_JS_EVAL = False
@@ -207,22 +208,24 @@ def _is_sleep_window(hour: int) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _init_state():
-    _now_init = datetime.datetime.now()
     defaults = {
-        "gps_lat":        None,
-        "gps_lon":        None,
-        "gps_label":      None,
-        "gps_pending":    False,
-        "gps_fetched":    False,    # True once auto-GPS has been attempted this session
-        "zone":           _zone_from_time(_now_init),  # time-based default
-        "zone_overridden": False,   # True if user manually picked a zone
-        "history":        [],
-        "engine_state":   None,
-        "last_scored":    None,
-        "last_result":    None,
-        "last_assembly":  None,
-        "day_date":       datetime.date.today().isoformat(),
-        "auto_refresh":   False,
+        "gps_lat":            None,
+        "gps_lon":            None,
+        "gps_label":          None,
+        "gps_pending":        False,
+        "gps_fetched":        False,
+        "zone":               "HOME",
+        "zone_overridden":    False,
+        "history":            [],
+        "engine_state":       None,
+        "last_scored":        None,
+        "last_scored_hour":   None,   # local hour of last score — detects new hour
+        "last_result":        None,
+        "last_assembly":      None,
+        "day_date":           None,   # set below after timezone is known
+        "use_mock":           None,   # None = not yet initialised
+        "last_refresh_count": 0,      # tracks autorefresh cycles
+        "user_tz_str":        "UTC",  # filled from browser Intl API
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -230,20 +233,48 @@ def _init_state():
 
 _init_state()
 
-# Reset history at 07:00 (matches engine close_day boundary)
-_now = datetime.datetime.now()
+# ── Timezone: resolve once from browser, persist in session_state ────────────
+if _HAS_JS_EVAL and st.session_state.user_tz_str == "UTC":
+    try:
+        _tz_raw = streamlit_js_eval(
+            js_expressions="Intl.DateTimeFormat().resolvedOptions().timeZone",
+            key="tz_detect",
+        )
+        if _tz_raw and isinstance(_tz_raw, str):
+            zoneinfo.ZoneInfo(_tz_raw)          # validate — raises if unknown
+            st.session_state.user_tz_str = _tz_raw
+    except Exception:
+        pass   # keep UTC
+
+try:
+    _TZ = zoneinfo.ZoneInfo(st.session_state.user_tz_str)
+except Exception:
+    _TZ = zoneinfo.ZoneInfo("UTC")
+
+def _local_now() -> datetime.datetime:
+    return datetime.datetime.now(tz=_TZ)
+
+_now = _local_now()
+
+# ECS day: runs 07:00-06:59. Hours 00-06 belong to the previous calendar day.
 _period_date = _now.date() if _now.hour >= 7 else (_now.date() - datetime.timedelta(days=1))
 today = _period_date.isoformat()
 
-if st.session_state.day_date != today:
-    st.session_state.history       = []
-    st.session_state.engine_state  = None
-    st.session_state.day_date      = today
-    st.session_state.zone_overridden = False  # reset override at start of new day
+# First run: seed day_date
+if st.session_state.day_date is None:
+    st.session_state.day_date = today
 
-# Keep zone in sync with time unless user has overridden it
-if not st.session_state.zone_overridden:
-    st.session_state.zone = _zone_from_time(_now)
+if st.session_state.day_date != today:
+    st.session_state.history          = []
+    st.session_state.engine_state     = None
+    st.session_state.day_date         = today
+    st.session_state.last_scored_hour = None
+    st.session_state.zone_overridden  = False
+
+# ── Reset GPS on every autorefresh cycle so coords stay current ──────────────
+if _refresh_count != st.session_state.last_refresh_count:
+    st.session_state.gps_fetched        = False
+    st.session_state.last_refresh_count = _refresh_count
 
 # ── Auto-GPS: fires once per session via streamlit-js-eval ───────────────────
 # get_geolocation() calls navigator.geolocation.getCurrentPosition in the
@@ -267,9 +298,12 @@ if _HAS_JS_EVAL and not st.session_state.gps_fetched:
             pass  # GPS denied or not available — falls back to manual sidebar
     st.session_state.gps_fetched = True
 
-# ── Auto-refresh via streamlit-autorefresh (hourly) ─────────────────────────
-if _HAS_AUTOREFRESH and st.session_state.get("auto_refresh"):
-    st_autorefresh(interval=3_600_000, key="ecs_hourly_refresh")  # 60 min in ms
+# ── Always-on autorefresh (must be called before any widget) ────────────────
+# Fires a full rerun every 60 min regardless of toggle.
+# We track the count so we know when a new cycle just fired.
+_refresh_count = 0
+if _HAS_AUTOREFRESH:
+    _refresh_count = st_autorefresh(interval=3_600_000, limit=None, key="ecs_hourly")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR — API KEYS + MODE
@@ -278,18 +312,28 @@ if _HAS_AUTOREFRESH and st.session_state.get("auto_refresh"):
 with st.sidebar:
     st.markdown("### 🌿 ECS Settings")
 
-    # Try Streamlit secrets first, then sidebar inputs
-    _secrets = getattr(st, "secrets", {})
+    # Secrets — loaded once; never reset the toggle after first run
+    _secrets    = getattr(st, "secrets", {})
     default_owm    = _secrets.get("OWM_API_KEY",    "")
     default_google = _secrets.get("GOOGLE_API_KEY", "")
 
-    use_mock = st.toggle("Use mock data (no API keys needed)", value=not bool(default_owm))
+    # First run: default mock OFF if keys are present in secrets, ON otherwise
+    if st.session_state.use_mock is None:
+        st.session_state.use_mock = not bool(default_owm)
+
+    _mock_toggled = st.toggle(
+        "Use mock data (no API keys needed)",
+        value=st.session_state.use_mock,
+    )
+    st.session_state.use_mock = _mock_toggled
+    use_mock = _mock_toggled
 
     if not use_mock:
         owm_key    = st.text_input("OpenWeatherMap API key", value=default_owm,    type="password")
         google_key = st.text_input("Google Pollen API key",  value=default_google, type="password")
         if not owm_key or not google_key:
             st.warning("Enter both keys or enable mock mode.")
+            st.session_state.use_mock = True
             use_mock = True
     else:
         owm_key    = ""
@@ -317,14 +361,14 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Auto-refresh**")
-    _ar = st.toggle(
-        "Score every 60 min automatically",
-        value=st.session_state.get("auto_refresh", False),
-        help="Requires `streamlit-autorefresh` package. Scores every hour without clicking."
-    )
-    st.session_state.auto_refresh = _ar
-    if _ar and not _HAS_AUTOREFRESH:
-        st.caption("⚠ `pip install streamlit-autorefresh` to activate.")
+    if _HAS_AUTOREFRESH:
+        mins_left = 60 - _now.minute
+        st.success(f"✅ Scoring every 60 min automatically")
+        st.caption(f"Next refresh in ~{mins_left} min · TZ: {st.session_state.user_tz_str}")
+    else:
+        st.warning("⚠ Install `streamlit-autorefresh` to enable auto-scoring.")
+    if st.session_state.last_scored:
+        st.caption(f"Last scored: {st.session_state.last_scored.strftime('%H:%M:%S')}")
 
     st.divider()
     if st.button("🗑 Clear today's history"):
@@ -440,12 +484,13 @@ def _effective_coords():
     return manual_lat, manual_lon
 
 def _score_now():
-    lat, lon   = _effective_coords()
-    hour       = datetime.datetime.now().hour
-    zone_str   = st.session_state.zone
-    zone       = LocationZone(zone_str.lower())
-    in_sleep   = _is_sleep_window(hour)
-    assembler  = _get_assembler()
+    lat, lon     = _effective_coords()
+    local_dt     = _local_now()
+    hour         = local_dt.hour
+    zone_str     = st.session_state.zone
+    zone         = LocationZone(zone_str.lower())
+    in_sleep     = _is_sleep_window(hour)
+    assembler    = _get_assembler()
     engine_state = _get_or_init_engine_state()
 
     try:
@@ -453,7 +498,7 @@ def _score_now():
             lat              = lat,
             lon              = lon,
             zone             = zone,
-            indoor_overrides = None,   # no sensors yet — infiltration only
+            indoor_overrides = None,   # no sensors — outdoor AQ x infiltration only
         )
     except Exception as e:
         st.error(f"Data fetch failed: {e}")
@@ -462,32 +507,35 @@ def _score_now():
     reading = HourlyReading(
         timestamp            = hour,
         pollutants           = assembly.pollutants,
-        biomarkers           = None,
+        biomarkers           = None,    # wearable integration added later
         in_sleep_window      = in_sleep,
         protection_confirmed = False,
     )
 
     result = compute_hourly_ECS(reading, engine_state)
 
-    # Store into history (deduplicate by hour)
+    # Store raw API readings alongside scores so history charts have real data
     entry = {
-        "hour": hour,
-        "ecs":  result["ECS"],
-        "A":    result["A"],
-        "B":    result["B"],
-        "C":    result["C"],
-        "D":    result["D"],
-        "ts":   datetime.datetime.now().strftime("%H:%M"),
-        "zone": zone_str,
+        "hour":     hour,
+        "ecs":      result["ECS"],
+        "A":        result["A"],
+        "B":        result["B"],
+        "C":        result["C"],
+        "D":        result["D"],
+        "ts":       local_dt.strftime("%H:%M"),
+        "zone":     zone_str,
         "offending": result.get("offending", []),
+        "raw":      {**assembly.outdoor_raw, **assembly.pollen_raw},
+        "indoor":   dict(assembly.pollutants),
     }
     history = [h for h in st.session_state.history if h["hour"] != hour]
     history.append(entry)
     history.sort(key=lambda x: x["hour"])
-    st.session_state.history      = history
-    st.session_state.last_result  = result
-    st.session_state.last_assembly = assembly
-    st.session_state.last_scored  = datetime.datetime.now()
+    st.session_state.history          = history
+    st.session_state.last_result      = result
+    st.session_state.last_assembly    = assembly
+    st.session_state.last_scored      = local_dt
+    st.session_state.last_scored_hour = hour
 
     return result, assembly
 
@@ -495,6 +543,13 @@ def _score_now():
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN UI
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ── Auto-score trigger ────────────────────────────────────────────────────────
+# Score when: (a) no result yet, or (b) current hour differs from last scored hour
+_need_score = (
+    st.session_state.last_result is None
+    or st.session_state.last_scored_hour != _now.hour
+)
 
 # ── Title ─────────────────────────────────────────────────────────────────────
 st.markdown("## 🌿 Environmental Capital Score")
@@ -566,16 +621,15 @@ col_score, col_time = st.columns([1, 2])
 with col_score:
     score_now = st.button("⚡ Score this hour", type="primary", use_container_width=True)
 with col_time:
-    now = datetime.datetime.now()
-    sleep_flag = "🌙 Sleep window" if _is_sleep_window(now.hour) else ""
+    sleep_flag = "🌙 Sleep window" if _is_sleep_window(_now.hour) else ""
     st.markdown(
-        f"<small style='color:#888'>{now.strftime('%A %d %b · %H:%M')}  "
+        f"<small style='color:#888'>{_now.strftime('%A %d %b · %H:%M')} {st.session_state.user_tz_str}  "
         f"{sleep_flag}  {'📡 MOCK' if use_mock else '🔴 LIVE'}</small>",
         unsafe_allow_html=True,
     )
 
-# Auto-score on first load if no result yet
-if score_now or st.session_state.last_result is None:
+# Score on: manual button press, first load, or start of a new hour
+if score_now or _need_score:
     with st.spinner("Fetching air quality and pollen…"):
         result, assembly = _score_now()
 else:
@@ -587,7 +641,7 @@ if result is not None:
     ecs_score         = result["ECS"]
     band, icon        = ecs_band(ecs_score)
     color             = _color_for_score(ecs_score)
-    last_scored_str   = st.session_state.last_scored.strftime("%H:%M:%S") if st.session_state.last_scored else "—"
+    last_scored_str   = st.session_state.last_scored.strftime("%H:%M:%S %Z") if st.session_state.last_scored else "—"
 
     st.markdown(f"""
 <div class="score-card">
@@ -771,7 +825,7 @@ if result is not None:
 
 # ── History chart ─────────────────────────────────────────────────────────────
 history = st.session_state.history
-if len(history) >= 2:
+if len(history) >= 1:
     st.markdown("---")
     st.markdown("#### Today's ECS — hourly history")
 
