@@ -45,6 +45,35 @@ from ecs_data_layer import (
     LocationZone, INDOOR_ZONES,
 )
 
+# ── Display unit conversions ──────────────────────────────────────────────────
+# Engine always stores µg/m³ (particles) or mg/m³ (CO) internally.
+# NO2 and O3 displayed in ppb; CO displayed in ppm; PM2.5/PM10 stay µg/m³.
+# Conversion at 25°C, 1 atm:
+#   NO2:  1 µg/m³ = 1/1.88  ppb  (mol weight 46 g/mol)
+#   O3:   1 µg/m³ = 1/1.99  ppb  (mol weight 48 g/mol)
+#   CO:   1 mg/m³ = 1/1.145 ppm  (mol weight 28 g/mol)
+UNIT_CONVERT = {
+    "no2": {"factor": 1/1.88,  "unit": "ppb", "who_engine": 25.0},
+    "o3":  {"factor": 1/1.99,  "unit": "ppb", "who_engine": 100.0},
+    "co":  {"factor": 1/1.145, "unit": "ppm", "who_engine": 4.0},
+}
+
+def _display_val(key, engine_val):
+    if key in UNIT_CONVERT:
+        c = UNIT_CONVERT[key]
+        dval  = round(engine_val * c["factor"], 2)
+        who_d = round(c["who_engine"] * c["factor"], 1)
+        return dval, c["unit"], who_d
+    unit_map = {
+        "pm25": "µg/m³", "pm10": "µg/m³",
+        "pollen_tree": "gr/m³", "pollen_grass": "gr/m³", "pollen_weed": "gr/m³",
+        "co2": "ppm", "radon": "Bq/m³", "humidity": "%", "temp": "°C",
+    }
+    from ecs_engine import WHO_THRESHOLDS as _WHO
+    who_raw = _WHO.get(key)
+    who_d   = who_raw[0] if isinstance(who_raw, tuple) else who_raw
+    return engine_val, unit_map.get(key, ""), who_d
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="ECS — Environmental Capital Score",
@@ -173,32 +202,11 @@ st.markdown("""
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _zone_from_time(dt: datetime.datetime) -> str:
-    """
-    Infer the most likely zone from time of day + weekday.
-    Used as the default zone on first load and after each 07:00 reset.
-    User can always override via the zone buttons.
-
-    Heuristic:
-      00:00–06:59  → HOME   (sleep, belongs to previous ECS day)
-      07:00–08:29  → COMMUTE on weekdays, HOME on weekends
-      08:30–17:29  → WORK on weekdays, HOME on weekends
-      17:30–18:59  → COMMUTE on weekdays, HOME on weekends
-      19:00–22:59  → HOME
-      23:00–23:59  → HOME (sleep window)
-    """
-    h, m = dt.hour, dt.minute
-    is_weekday = dt.weekday() < 5
-    hm = h * 60 + m
-    if hm < 7 * 60:
-        return "HOME"
-    elif hm < 8 * 60 + 30:
-        return "COMMUTE" if is_weekday else "HOME"
-    elif hm < 17 * 60 + 30:
-        return "WORK" if is_weekday else "HOME"
-    elif hm < 19 * 60:
-        return "COMMUTE" if is_weekday else "HOME"
-    else:
-        return "HOME"
+    """HOME during sleep/evening/night, OUTDOOR during daytime hours."""
+    h = dt.hour
+    if 8 <= h < 20:
+        return "OUTDOOR"
+    return "HOME"
 
 def _is_sleep_window(hour: int) -> bool:
     return hour >= 23 or hour < 7
@@ -248,6 +256,7 @@ if _HAS_JS_EVAL and st.session_state.user_tz_str == "UTC":
         if _tz_raw and isinstance(_tz_raw, str):
             zoneinfo.ZoneInfo(_tz_raw)          # validate — raises if unknown
             st.session_state.user_tz_str = _tz_raw
+            st.rerun()  # rerun so all time logic uses local tz from start
     except Exception:
         pass   # keep UTC
 
@@ -270,6 +279,9 @@ if st.session_state.day_date is None:
     st.session_state.day_date = today
 
 if st.session_state.day_date != today:
+    # Properly close the previous ECS day — resets exposure streak
+    if st.session_state.engine_state is not None:
+        close_day(st.session_state.engine_state, st.session_state.day_date)
     st.session_state.history          = []
     st.session_state.engine_state     = None
     st.session_state.day_date         = today
@@ -430,6 +442,64 @@ function requestGPS() {
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Unit conversion — display only ──────────────────────────────────────────
+# Engine stores all values in µg/m³ (particles) and mg/m³ (CO).
+# WHO thresholds and weights all use these native units — DO NOT change them.
+# Conversion is purely cosmetic: shown in pollutant tables and metric cards.
+#
+# At 25°C, 1 atm:
+#   NO2: 1 ppb = 1.88 µg/m³   → ppb = µg/m³ ÷ 1.88
+#   O3:  1 ppb = 1.96 µg/m³   → ppb = µg/m³ ÷ 1.96
+#   CO:  1 ppb = 1.145 µg/m³  → ppb = mg/m³ × (1000 ÷ 1.145)
+#
+# PM2.5 and PM10 stay in µg/m³ (this is the standard display unit globally).
+_NO2_PPB  = 1.88    # µg/m³ per ppb
+_O3_PPB   = 1.96    # µg/m³ per ppb
+_CO_PPB   = 1.145   # µg/m³ per ppb (engine stores CO in mg/m³ so ×1000 first)
+
+def _to_display(key: str, engine_val: float) -> tuple:
+    """Convert engine-unit value to display value and unit string.
+    Returns (display_value, unit_string, who_display, who_unit).
+    WHO display value is also converted to the same display unit.
+    """
+    WHO_ENG = {
+        "pm25": 15.0, "pm10": 45.0, "no2": 25.0, "o3": 100.0, "co": 4.0,
+        "co2": 1000.0, "radon": 100.0,
+        "pollen_tree": 50.0, "pollen_grass": 50.0, "pollen_weed": 10.0,
+    }
+    who_eng = WHO_ENG.get(key)
+
+    if key == "no2":
+        val  = round(engine_val / _NO2_PPB, 1)
+        who  = round(who_eng   / _NO2_PPB, 1) if who_eng else None
+        return val, "ppb", who, "ppb"
+    elif key == "o3":
+        val  = round(engine_val / _O3_PPB,  1)
+        who  = round(who_eng    / _O3_PPB,  1) if who_eng else None
+        return val, "ppb", who, "ppb"
+    elif key == "co":
+        # Engine stores CO in mg/m³
+        val  = round(engine_val * 1000.0 / _CO_PPB, 0)
+        who  = round(who_eng    * 1000.0 / _CO_PPB, 0) if who_eng else None
+        return int(val), "ppb", int(who) if who else None, "ppb"
+    elif key == "pm25":
+        return round(engine_val, 1), "µg/m³", who_eng, "µg/m³"
+    elif key == "pm10":
+        return round(engine_val, 1), "µg/m³", who_eng, "µg/m³"
+    elif key == "co2":
+        return round(engine_val, 0), "ppm", who_eng, "ppm"
+    elif key == "radon":
+        return round(engine_val, 1), "Bq/m³", who_eng, "Bq/m³"
+    elif key in ("pollen_tree", "pollen_grass", "pollen_weed"):
+        return round(engine_val, 1), "gr/m³", who_eng, "gr/m³"
+    elif key == "temp":
+        return round(engine_val, 1), "°C", None, ""
+    elif key == "humidity":
+        return round(engine_val, 1), "%", None, ""
+    else:
+        return round(engine_val, 3), "", None, ""
+
+
 BAND_COLORS = {
     "Excellent":  "#51cf66",
     "Good":       "#94d82d",
@@ -441,20 +511,19 @@ BAND_COLORS = {
 
 COMP_COLORS = {
     "A": "#74c0fc",
-    "B": "#63e6be",
+    "B": "#ff6b6b",   # B = penalty layer — red
     "C": "#ffa94d",
     "D": "#da77f2",
 }
 
 COMP_LABELS = {
     "A": "A — Instant air quality",
-    "B": "B — 3h stability",
-    "C": "C — 30-day load",
+    "C": "C — 30-day chronic load",
     "D": "D — Sleep environment",
 }
 
-ZONE_OPTIONS = ["HOME", "WORK", "OUTDOOR", "COMMUTE"]
-ZONE_ICONS   = {"HOME": "🏠", "WORK": "🏢", "OUTDOOR": "🌳", "COMMUTE": "🚌"}
+ZONE_OPTIONS = ["HOME", "OUTDOOR"]
+ZONE_ICONS   = {"HOME": "🏠", "OUTDOOR": "🌳"}
 
 def _color_for_score(score: float) -> str:
     if score >= 90: return BAND_COLORS["Excellent"]
@@ -518,17 +587,20 @@ def _score_now():
 
     # Store raw API readings alongside scores so history charts have real data
     entry = {
-        "hour":     hour,
-        "ecs":      result["ECS"],
-        "A":        result["A"],
-        "B":        result["B"],
-        "C":        result["C"],
-        "D":        result["D"],
-        "ts":       local_dt.strftime("%H:%M"),
-        "zone":     zone_str,
+        "hour":      hour,
+        "ecs":       result["ECS"],
+        "A":         result["A"],
+        "B":         result["B"],
+        "C":         result["C"],
+        "D":         result["D"],
+        "ts":        local_dt.strftime("%H:%M"),
+        "zone":      zone_str,
         "offending": result.get("offending", []),
-        "raw":      {**assembly.outdoor_raw, **assembly.pollen_raw},
-        "indoor":   dict(assembly.pollutants),
+        "streak":    result.get("exposure_streak", 0),
+        "penalty":   result.get("penalty_pts", 0),
+        "raw":       {**assembly.outdoor_raw, **assembly.pollen_raw},
+        "indoor":    dict(assembly.pollutants),
+        "backfilled": False,
     }
     history = [h for h in st.session_state.history if h["hour"] != hour]
     history.append(entry)
@@ -541,9 +613,125 @@ def _score_now():
 
     return result, assembly
 
+
+def _backfill_missing_hours():
+    """
+    Called on app open when hours have been missed (browser was closed).
+    Uses OWM historical API to fetch AQ for each missed hour and scores them.
+    Pollen is held constant at today's value (Google Pollen is daily only).
+    Silently fills history so user sees a complete picture when they return.
+    Only backfills within the current ECS day (07:00 boundary).
+    """
+    local_dt     = _local_now()
+    current_hour = local_dt.hour
+    last_hour    = st.session_state.last_scored_hour
+
+    if last_hour is None or last_hour == current_hour:
+        return
+
+    day_start = 7
+    if current_hour >= day_start:
+        valid_hours = list(range(day_start, current_hour))
+    else:
+        valid_hours = list(range(day_start, 24)) + list(range(0, current_hour))
+
+    scored_hours = {h["hour"] for h in st.session_state.history}
+    missing      = [h for h in valid_hours if h not in scored_hours]
+    if not missing:
+        return
+
+    lat, lon     = _effective_coords()
+    assembler    = _get_assembler()
+    engine_state = _get_or_init_engine_state()
+
+    try:
+        pollen_raw = assembler.pollen.fetch(lat, lon)
+    except Exception:
+        pollen_raw = {"pollen_tree": 0, "pollen_grass": 0, "pollen_weed": 0}
+
+    def _hour_to_ts(h):
+        d = local_dt.date()
+        if current_hour < day_start and h >= day_start:
+            d = d - datetime.timedelta(days=1)
+        return int(datetime.datetime(d.year, d.month, d.day, h, 0, 0,
+                                     tzinfo=_TZ).timestamp())
+
+    start_ts = _hour_to_ts(missing[0])
+    end_ts   = _hour_to_ts(missing[-1]) + 3600
+
+    try:
+        history_data = assembler.owm.fetch_history(lat, lon, start_ts, end_ts)
+    except Exception:
+        return
+
+    hour_to_aq = {}
+    for entry in history_data:
+        h = datetime.datetime.fromtimestamp(entry["timestamp"], tz=_TZ).hour
+        hour_to_aq[h] = entry
+
+    zone_str  = st.session_state.zone
+    zone      = LocationZone(zone_str.lower())
+    zone_val  = zone.value
+    is_indoor = zone_val in {z.value for z in INDOOR_ZONES}
+    new_entries = []
+
+    for h in sorted(missing):
+        if h not in hour_to_aq:
+            continue
+        aq = hour_to_aq[h]
+        outdoor_raw = {k: aq[k] for k in ("pm25","pm10","no2","o3","co")}
+
+        if is_indoor:
+            pollutants = {k: round(v * INFILTRATION_FACTORS[k], 3)
+                          for k, v in outdoor_raw.items()}
+            for pk, pv in pollen_raw.items():
+                pollutants[pk] = round(pv * INFILTRATION_FACTORS.get(pk, 0.10), 3)
+        else:
+            pollutants = dict(outdoor_raw)
+            pollutants.update(pollen_raw)
+
+        in_sleep = _is_sleep_window(h)
+        reading  = HourlyReading(
+            timestamp=h, pollutants=pollutants,
+            biomarkers=None, in_sleep_window=in_sleep,
+            protection_confirmed=False,
+        )
+        result = compute_hourly_ECS(reading, engine_state)
+
+        new_entries.append({
+            "hour":       h,
+            "ecs":        result["ECS"],
+            "A":          result["A"],  "B": result["B"],
+            "C":          result["C"],  "D": result["D"],
+            "ts":         f"{h:02d}:00",
+            "zone":       zone_str,
+            "offending":  result.get("offending", []),
+            "streak":     result.get("exposure_streak", 0),
+            "penalty":    result.get("penalty_pts", 0),
+            "raw":        {**outdoor_raw, **pollen_raw},
+            "indoor":     dict(pollutants),
+            "backfilled": True,
+        })
+
+    if new_entries:
+        existing    = {e["hour"] for e in st.session_state.history}
+        combined    = st.session_state.history + [e for e in new_entries if e["hour"] not in existing]
+        combined.sort(key=lambda x: x["hour"])
+        st.session_state.history      = combined
+        st.session_state.engine_state = engine_state
+        if combined:
+            st.session_state.last_scored_hour = combined[-1]["hour"]
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN UI
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ── Backfill missed hours (silently, before rendering) ───────────────────────
+# If the browser was closed and hours were missed, fetch OWM historical data
+# and score each missed hour so history is complete when user returns.
+if (st.session_state.last_scored_hour is not None
+        and st.session_state.last_scored_hour != _now.hour):
+    _backfill_missing_hours()
 
 # ── Auto-score trigger ────────────────────────────────────────────────────────
 # Score when: (a) no result yet, or (b) current hour differs from last scored hour
@@ -595,7 +783,7 @@ _override   = st.session_state.zone_overridden
 _hint = f"⏰ Suggested from time ({_now.strftime('%H:%M')})" if not _override else "✏️ Manually set"
 st.markdown(f"**Where are you right now?**  <small style='color:#666'>{_hint}</small>", unsafe_allow_html=True)
 
-zone_cols = st.columns(4)
+zone_cols = st.columns(2)
 for i, z in enumerate(ZONE_OPTIONS):
     with zone_cols[i]:
         is_active   = st.session_state.zone == z
@@ -652,10 +840,16 @@ if result is not None:
 </div>
 """, unsafe_allow_html=True)
 
-    # ── Components A/B/C/D ────────────────────────────────────────────────────
+    # ── Components A, C, D as bars + B as penalty readout ───────────────────
     st.markdown("#### Components")
+    streak  = result.get("exposure_streak", 0)
+    penalty = result.get("penalty_pts", 0)
+    bio     = result.get("bio_state", "neutral")
+    offend  = result.get("offending", [])
+    b_val   = result.get("B", 0)   # penalty pts — 0 when no streak
+
     comp_html = ""
-    for key in ["A", "B", "C", "D"]:
+    for key in ["A", "C", "D"]:
         val   = result[key]
         color = COMP_COLORS[key]
         label = COMP_LABELS[key]
@@ -667,22 +861,39 @@ if result is not None:
   </div>
   <div class="comp-value">{val:.1f}</div>
 </div>"""
+
+    # Component B — penalty layer (streak + bio) shown separately
+    if streak == 0:
+        b_label = "B — Exposure penalty"
+        b_color = "#555"
+        b_text  = "No penalty  (streak = 0)"
+    elif streak <= 2:
+        b_label = "B — Exposure penalty"
+        b_color = "#fcc419"
+        b_text  = f"⚠ Warning — streak {streak}h  (penalty starts at hour 3)"
+    else:
+        b_color = "#ff6b6b"
+        b_label = "B — Exposure penalty"
+        bio_tag = "  + bio-confirmed" if result.get("bio_confirmed") else ""
+        b_text  = f"−{b_val:.1f} pts  (streak {streak}h{bio_tag})"
+
+    comp_html += f"""
+<div class="comp-row">
+  <div class="comp-label" style="color:{b_color}">{b_label}</div>
+  <div class="comp-bar-bg" style="background:#1a1a1a">
+    <div style="padding:2px 8px;font-size:12px;color:{b_color}">{b_text}</div>
+  </div>
+  <div class="comp-value" style="color:{b_color}">{"−"+str(b_val) if b_val > 0 else "0"}</div>
+</div>"""
+
     st.markdown(comp_html, unsafe_allow_html=True)
     st.markdown("")
 
-    # streak / penalty info
-    streak  = result.get("exposure_streak", 0)
-    penalty = result.get("penalty_pts", 0)
-    bio     = result.get("bio_state", "neutral")
-    offend  = result.get("offending", [])
-
-    info_cols = st.columns(3)
+    info_cols = st.columns(2)
     with info_cols[0]:
-        st.metric("Exposure streak", f"{streak}h", help="Consecutive hours above WHO limits")
-    with info_cols[1]:
-        st.metric("Penalty this hour", f"-{penalty:.1f} pts")
-    with info_cols[2]:
         st.metric("Body state", bio.replace("_", " ").title())
+    with info_cols[1]:
+        st.metric("Exposure streak", f"{streak}h", help="Consecutive hours above WHO limits")
 
     if offend:
         st.warning(f"⚠️ Above WHO limits: **{', '.join(offend).upper()}**")
@@ -713,39 +924,34 @@ if result is not None:
             "co2": "CO₂", "radon": "Radon", "humidity": "Humidity", "temp": "Temperature",
         }
 
+        # Sensor-only pollutants — always show in table, blank if no sensor data
+        SENSOR_ONLY_KEYS = ["co2", "radon", "humidity", "temp"]
+        SENSOR_UNITS     = {"co2": "ppm", "radon": "Bq/m³", "humidity": "%", "temp": "°C"}
+
         rows = ""
         for key, final_val in sorted(assembly.pollutants.items()):
             name    = DISPLAY_NAMES.get(key, key)
-            unit    = DISPLAY_UNITS.get(key, "")
-            # outdoor_raw holds AQ pollutants; pollen_raw holds pollen — check both
             outdoor = assembly.outdoor_raw.get(key) if assembly.outdoor_raw.get(key) is not None \
                       else assembly.pollen_raw.get(key)
             factor  = INFILTRATION_FACTORS.get(key)
-            who     = WHO_THRESHOLDS.get(key)
-            if isinstance(who, tuple): who = who[0]
 
-            # For WHO comparison: use outdoor raw for pollen when indoors
-            # (pollen is heavily attenuated indoors by ×0.10, but the health risk
-            #  is from what you were exposed to outdoors — flag if outdoor raw is high)
-            compare_val = final_val
+            # Convert to display units (ppb for NO2/O3, ppm for CO, unchanged for rest)
+            disp_final, unit, who_disp = _display_val(key, final_val)
+            disp_outdoor = round(outdoor * UNIT_CONVERT[key]["factor"], 2) if (outdoor is not None and key in UNIT_CONVERT) else outdoor
+            who_str = f"{who_disp}" if who_disp is not None else "—"
+
+            # For pollen: WHO comparison uses outdoor raw (indoor heavily attenuated)
+            compare_val = disp_final
             if is_indoor and outdoor is not None and key in ("pollen_tree", "pollen_grass", "pollen_weed"):
-                compare_val = outdoor
+                compare_val = disp_outdoor if disp_outdoor is not None else disp_final
 
-            above   = who is not None and compare_val > who
-            css_val = "above-who" if above else "below-who"
-            who_str = f"{who}" if who is not None else "—"
+            above       = who_disp is not None and compare_val > who_disp
+            outdoor_str = f"{disp_outdoor}" if disp_outdoor is not None else "—"
 
-            # Always show the outdoor raw number — it tells the user what the real exposure was
-            if outdoor is not None:
-                outdoor_str = f"{outdoor}"
-            else:
-                outdoor_str = "—"
-
-            # Infiltration factor — only meaningful indoors
             if is_indoor and factor is not None and outdoor is not None:
-                engine_str = f"{final_val}  <span style='color:#555;font-size:11px'>(×{factor})</span>"
+                engine_str = f"{disp_final}  <span style='color:#555;font-size:11px'>(×{factor})</span>"
             else:
-                engine_str = f"{final_val}"
+                engine_str = f"{disp_final}"
 
             # Status badge
             if above:
@@ -761,6 +967,24 @@ if result is not None:
   <td style="color:#888">{outdoor_str}</td>
   <td>{engine_str}</td>
   <td style="{badge_css}">{badge}</td>
+  <td style="color:#555">{who_str}</td>
+  <td style="color:#555">{unit}</td>
+</tr>"""
+
+        # Add sensor-only rows — always shown, marked blank if no sensor connected
+        if is_indoor:
+            for key in SENSOR_ONLY_KEYS:
+                if key in assembly.pollutants:
+                    continue  # already shown above
+                name     = DISPLAY_NAMES.get(key, key)
+                _, unit, who_disp = _display_val(key, 0)
+                who_str  = f"{who_disp}" if who_disp is not None else "—"  if who is not None else "—"
+                rows += f"""
+<tr style="color:#555;font-style:italic">
+  <td>{name}</td>
+  <td style="color:#555">—</td>
+  <td style="color:#555">—  <span style='font-size:10px'>(no sensor)</span></td>
+  <td style="color:#555">—</td>
   <td style="color:#555">{who_str}</td>
   <td style="color:#555">{unit}</td>
 </tr>"""
@@ -829,13 +1053,14 @@ if len(history) >= 1:
     st.markdown("---")
     st.markdown("#### Today's ECS — hourly history")
 
+    hours  = [h["hour"] for h in history]
+    scores = [h["ecs"]  for h in history]
+    zones  = [h.get("zone", "?") for h in history]
+    labels = [f"{h['ts']}  ECS {h['ecs']}  {h.get('zone','')}{'  ↩backfilled' if h.get('backfilled') else ''}"
+              for h in history]
+
     try:
         import plotly.graph_objects as go
-
-        hours  = [h["hour"] for h in history]
-        scores = [h["ecs"] for h in history]
-        zones  = [h.get("zone", "?") for h in history]
-        labels = [f"{h['ts']}  ECS {h['ecs']}  {h.get('zone','')}" for h in history]
 
         point_colors = [_color_for_score(s) for s in scores]
 
@@ -879,8 +1104,8 @@ if len(history) >= 1:
 
         st.plotly_chart(fig, use_container_width=True)
 
-    except ImportError:
-        # Fallback to st.line_chart if plotly not available
+    except Exception as _chart_err:
+        # Fallback to st.line_chart if plotly unavailable or fails
         import pandas as pd
         df = pd.DataFrame({"Hour": hours, "ECS": scores}).set_index("Hour")
         st.line_chart(df)
@@ -905,6 +1130,182 @@ if len(history) >= 1:
 elif len(history) == 1:
     st.markdown("---")
     st.info("Score at least 2 hours to see the history chart. Come back next hour or click ⚡ again.")
+
+# ── Auto-refresh handled at top of file via streamlit-autorefresh ─────────────
+
+# ── GPS JS bridge ─────────────────────────────────────────────────────────────
+# Real GPS detection: JS posts coords to query params, Streamlit picks them up on rerun
+GPS_BRIDGE = """
+<script>
+(function() {
+    function detect() {
+        if (!navigator.geolocation) return;
+        navigator.geolocation.getCurrentPosition(function(pos) {
+            var lat = pos.coords.latitude.toFixed(6);
+            var lon = pos.coords.longitude.toFixed(6);
+            // Update URL query params so Streamlit reads them on next interaction
+            var url = new URL(window.parent.location.href);
+            url.searchParams.set('gps_lat', lat);
+            url.searchParams.set('gps_lon', lon);
+            window.parent.history.replaceState({}, '', url.toString());
+            // Trigger Streamlit rerun by dispatching a click on the hidden rerun target
+            window.parent.dispatchEvent(new Event('streamlit:rerun'));
+        }, function(err) {
+            console.warn('GPS error:', err.message);
+        }, {enableHighAccuracy: true, timeout: 8000});
+    }
+    // Auto-detect on page load (once)
+    if (!window._ecs_gps_init) {
+        window._ecs_gps_init = true;
+        detect();
+    }
+    // Also wire the visible GPS button
+    window.requestGPS = detect;
+})();
+</script>
+"""
+components.html(GPS_BRIDGE, height=0)# ── History — always visible ─────────────────────────────────────────────────
+history = st.session_state.history
+st.markdown("---")
+st.markdown("#### 📋 Today's hourly history")
+
+if not history:
+    st.info("No readings yet today. Hit **⚡ Score this hour** to start, or come back after the first hour — missed readings are backfilled automatically.")
+else:
+    # ── ECS chart ──────────────────────────────────────────────────────────
+    hours  = [h["hour"] for h in history]
+    scores = [h["ecs"]  for h in history]
+    zones  = [h.get("zone", "?") for h in history]
+    labels = [f"{h['ts']}  ECS {h['ecs']}  {h.get('zone','')}{'  ↩' if h.get('backfilled') else ''}"
+              for h in history]
+
+    try:
+        import plotly.graph_objects as go
+        point_colors  = [_color_for_score(s) for s in scores]
+        marker_symbols = ["circle-open" if h.get("backfilled") else "circle" for h in history]
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=hours, y=scores,
+            mode="lines+markers",
+            line=dict(color="#51cf66", width=2),
+            marker=dict(color=point_colors, size=10,
+                        symbol=marker_symbols,
+                        line=dict(color="#1a1a2e", width=2)),
+            text=labels,
+            hovertemplate="%{text}<extra></extra>",
+            fill="tozeroy",
+            fillcolor="rgba(81,207,102,0.08)",
+        ))
+        fig.add_hrect(y0=75, y1=100, fillcolor="rgba(81,207,102,0.05)",  line_width=0)
+        fig.add_hrect(y0=60, y1=75,  fillcolor="rgba(148,216,45,0.05)",  line_width=0)
+        fig.add_hrect(y0=40, y1=60,  fillcolor="rgba(252,196,25,0.05)",  line_width=0)
+        fig.add_hrect(y0=0,  y1=40,  fillcolor="rgba(255,107,107,0.05)", line_width=0)
+        fig.update_layout(
+            paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+            font=dict(color="#888", size=12),
+            xaxis=dict(title="Hour", tickmode="linear", dtick=1,
+                       range=[-0.5, 23.5],
+                       gridcolor="#1e1e2e", zerolinecolor="#1e1e2e"),
+            yaxis=dict(title="ECS", range=[0, 100],
+                       gridcolor="#1e1e2e", zerolinecolor="#1e1e2e"),
+            margin=dict(l=40, r=20, t=20, b=40),
+            height=260, showlegend=False,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception:
+        import pandas as pd
+        df = pd.DataFrame({"Hour": hours, "ECS": scores}).set_index("Hour")
+        st.line_chart(df)
+
+    if any(h.get("backfilled") for h in history):
+        st.caption("↩ = backfilled from OWM historical data while browser was closed")
+
+    # ── Per-hour table — always visible, expandable detail per row ─────────
+    DISPLAY_NAMES_SHORT = {
+        "pm25": "PM2.5", "pm10": "PM10", "no2": "NO₂", "o3": "O₃", "co": "CO",
+        "pollen_tree": "Tree 🌲", "pollen_grass": "Grass 🌾", "pollen_weed": "Weed 🌿",
+        "co2": "CO₂", "radon": "Radon", "humidity": "RH%", "temp": "Temp °C",
+    }
+    WHO_SHORT = {
+        "pm25": 15, "pm10": 45, "no2": 25, "o3": 100, "co": 4,
+        "pollen_tree": 50, "pollen_grass": 50, "pollen_weed": 10,
+    }
+
+    for entry in reversed(history):
+        h        = entry["hour"]
+        ecs      = entry["ecs"]
+        color    = _color_for_score(ecs)
+        offend   = entry.get("offending", [])
+        streak   = entry.get("streak", "—")
+        penalty  = entry.get("penalty", 0)
+        bf_tag   = " ↩" if entry.get("backfilled") else ""
+        alert_tag = f"  ⚠ {', '.join(o.upper() for o in offend)}" if offend else ""
+
+        label = (
+            f"**{h:02d}:00**  ·  "
+            f"<span style='color:{color};font-weight:700'>{ecs}</span>  "
+            f"· {entry.get('zone','?')}{bf_tag}{alert_tag}"
+        )
+        with st.expander(f"{h:02d}:00  ECS {ecs}  {entry.get('zone','?')}{bf_tag}{alert_tag}"):
+            raw    = entry.get("raw", {})
+            indoor = entry.get("indoor", {})
+
+            # Show all known pollutants — blank if no data
+            all_keys = ["pm25","pm10","no2","o3","co",
+                        "pollen_tree","pollen_grass","pollen_weed",
+                        "co2","radon","humidity","temp"]
+
+            rows_html = ""
+            for key in all_keys:
+                name     = DISPLAY_NAMES_SHORT.get(key, key)
+                raw_val  = raw.get(key)
+                ind_val  = indoor.get(key)
+                who_lim  = WHO_SHORT.get(key, "—")
+                # Convert display units
+                disp_raw, unit_str, who_disp = _display_val(key, raw_val if raw_val is not None else 0)
+                disp_ind, _, _               = _display_val(key, ind_val if ind_val is not None else 0)
+                who_lim  = who_disp
+
+                raw_str = f"{disp_raw}" if raw_val is not None else "—"
+                ind_str = f"{disp_ind}" if ind_val is not None else "—"
+
+                # Highlight if above WHO
+                above = (raw_val is not None and isinstance(who_lim, (int,float))
+                         and disp_raw > who_lim)
+                row_style = "color:#ff6b6b" if above else "color:#ccc"
+                flag = " ⚠" if above else ""
+
+                rows_html += f"""
+<tr style="{row_style}">
+  <td>{name}{flag}</td>
+  <td>{raw_str}</td>
+  <td>{ind_str}</td>
+  <td style="color:#555">{who_lim}</td>
+  <td style="color:#555">{unit_str}</td>
+</tr>"""
+
+            st.markdown(f"""
+<table class="poll-table">
+  <thead><tr>
+    <th>Pollutant</th><th>Outdoor raw</th>
+    <th>Engine (infiltrated)</th><th>WHO limit</th><th>Unit</th>
+  </tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>""", unsafe_allow_html=True)
+
+            # Component scores for this hour
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("ECS",         entry["ecs"])
+            c2.metric("A — Instant", f"{entry['A']}")
+            c3.metric("C — Chronic", f"{entry['C']}")
+            c4.metric("D — Sleep",   f"{entry['D']}")
+            b_entry = entry.get("B", entry.get("penalty", 0))
+            sk      = entry.get("streak", 0)
+            if sk and int(sk) >= 3:
+                st.error(f"B — Penalty: −{b_entry} pts  |  Streak: {sk}h")
+            elif sk and int(sk) >= 1:
+                st.warning(f"B — Streak warning: {sk}h  (penalty fires at hour 3)")
 
 # ── Auto-refresh handled at top of file via streamlit-autorefresh ─────────────
 
