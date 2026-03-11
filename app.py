@@ -203,6 +203,11 @@ def _zone_from_time(dt: datetime.datetime) -> str:
 def _is_sleep_window(hour: int) -> bool:
     return hour >= 23 or hour < 7
 
+# ── Always-on autorefresh — must be before any widget ───────────────────────
+# _refresh_count is always defined here (0 if package missing) so all code
+# below can safely reference it without NameError.
+_refresh_count = st_autorefresh(interval=3_600_000, limit=None, key="ecs_hourly") if _HAS_AUTOREFRESH else 0
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SESSION STATE INIT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -301,9 +306,6 @@ if _HAS_JS_EVAL and not st.session_state.gps_fetched:
 # ── Always-on autorefresh (must be called before any widget) ────────────────
 # Fires a full rerun every 60 min regardless of toggle.
 # We track the count so we know when a new cycle just fired.
-_refresh_count = 0
-if _HAS_AUTOREFRESH:
-    _refresh_count = st_autorefresh(interval=3_600_000, limit=None, key="ecs_hourly")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR — API KEYS + MODE
@@ -538,7 +540,6 @@ def _score_now():
     st.session_state.last_scored_hour = hour
 
     return result, assembly
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN UI
@@ -822,7 +823,6 @@ if result is not None:
             st.markdown("**Full pollutants dict sent to engine**")
             st.json(assembly.pollutants)
 
-
 # ── History chart ─────────────────────────────────────────────────────────────
 history = st.session_state.history
 if len(history) >= 1:
@@ -906,9 +906,7 @@ elif len(history) == 1:
     st.markdown("---")
     st.info("Score at least 2 hours to see the history chart. Come back next hour or click ⚡ again.")
 
-
 # ── Auto-refresh handled at top of file via streamlit-autorefresh ─────────────
-
 
 # ── GPS JS bridge ─────────────────────────────────────────────────────────────
 # Real GPS detection: JS posts coords to query params, Streamlit picks them up on rerun
