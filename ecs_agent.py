@@ -15,10 +15,10 @@ SCOPE (current phase):
     4. Surface what it concluded and how confident it is
 
 CALL PATTERN (with live data layer):
-    from ecs_data_layer import PollutantAssembler, OpenWeatherMapClient, GooglePollenClient
+    from ecs_data_layer import PollutantAssembler, AirNowClient, GooglePollenClient
 
     assembler = PollutantAssembler(
-        owm_client    = OpenWeatherMapClient(api_key="YOUR_OWM_KEY"),
+        owm_client    = AirNowClient(api_key="YOUR_AIRNOW_KEY"),
         pollen_client = GooglePollenClient(api_key="YOUR_GOOGLE_KEY"),
     )
     agent = ECSAgent(profile=UserProfile(age_band="31-45"), assembler=assembler)
