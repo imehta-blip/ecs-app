@@ -40,39 +40,11 @@ from ecs_engine import (
     HourlyReading, UserState, WHO_THRESHOLDS,
 )
 from ecs_data_layer import (
-    OpenWeatherMapClient, GooglePollenClient, PollutantAssembler,
-    MockOWMClient, MockPollenClient, INFILTRATION_FACTORS,
+    AirNowClient, GooglePollenClient, PollutantAssembler,
+    MockAirNowClient, MockOWMClient, MockPollenClient, INFILTRATION_FACTORS,
     LocationZone, INDOOR_ZONES,
 )
 
-# ── Display unit conversions ──────────────────────────────────────────────────
-# Engine always stores µg/m³ (particles) or mg/m³ (CO) internally.
-# NO2 and O3 displayed in ppb; CO displayed in ppm; PM2.5/PM10 stay µg/m³.
-# Conversion at 25°C, 1 atm:
-#   NO2:  1 µg/m³ = 1/1.88  ppb  (mol weight 46 g/mol)
-#   O3:   1 µg/m³ = 1/1.99  ppb  (mol weight 48 g/mol)
-#   CO:   1 mg/m³ = 1/1.145 ppm  (mol weight 28 g/mol)
-UNIT_CONVERT = {
-    "no2": {"factor": 1/1.88,  "unit": "ppb", "who_engine": 25.0},
-    "o3":  {"factor": 1/1.99,  "unit": "ppb", "who_engine": 100.0},
-    "co":  {"factor": 1/1.145, "unit": "ppm", "who_engine": 4.0},
-}
-
-def _display_val(key, engine_val):
-    if key in UNIT_CONVERT:
-        c = UNIT_CONVERT[key]
-        dval  = round(engine_val * c["factor"], 2)
-        who_d = round(c["who_engine"] * c["factor"], 1)
-        return dval, c["unit"], who_d
-    unit_map = {
-        "pm25": "µg/m³", "pm10": "µg/m³",
-        "pollen_tree": "gr/m³", "pollen_grass": "gr/m³", "pollen_weed": "gr/m³",
-        "co2": "ppm", "radon": "Bq/m³", "humidity": "%", "temp": "°C",
-    }
-    from ecs_engine import WHO_THRESHOLDS as _WHO
-    who_raw = _WHO.get(key)
-    who_d   = who_raw[0] if isinstance(who_raw, tuple) else who_raw
-    return engine_val, unit_map.get(key, ""), who_d
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -209,7 +181,7 @@ def _zone_from_time(dt: datetime.datetime) -> str:
     return "HOME"
 
 def _is_sleep_window(hour: int) -> bool:
-    return hour >= 23 or hour < 7
+    return hour >= 22 or hour < 7   # sleep window: 22:00–06:59
 
 # ── Always-on autorefresh — must be before any widget ───────────────────────
 # _refresh_count is always defined here (0 if package missing) so all code
@@ -222,23 +194,27 @@ _refresh_count = st_autorefresh(interval=3_600_000, limit=None, key="ecs_hourly"
 
 def _init_state():
     defaults = {
-        "gps_lat":            None,
-        "gps_lon":            None,
-        "gps_label":          None,
-        "gps_pending":        False,
-        "gps_fetched":        False,
-        "zone":               "HOME",
-        "zone_overridden":    False,
-        "history":            [],
-        "engine_state":       None,
-        "last_scored":        None,
-        "last_scored_hour":   None,   # local hour of last score — detects new hour
-        "last_result":        None,
-        "last_assembly":      None,
-        "day_date":           None,   # set below after timezone is known
-        "use_mock":           None,   # None = not yet initialised
-        "last_refresh_count": 0,      # tracks autorefresh cycles
-        "user_tz_str":        "UTC",  # filled from browser Intl API
+        "gps_lat":              None,
+        "gps_lon":              None,
+        "gps_label":            None,
+        "gps_pending":          False,
+        "gps_fetched":          False,   # True once GPS asked on first load
+        "gps_permission_asked": False,   # True after first-load permission request
+        "zone":                 "HOME",
+        "zone_overridden":      False,
+        "history":              [],
+        "engine_state":         None,
+        "last_scored":          None,
+        "last_scored_hour":     None,    # local hour of last score
+        "last_result":          None,
+        "last_assembly":        None,
+        "day_date":             None,
+        "use_mock":             None,
+        "last_refresh_count":   0,       # tracks autorefresh cycles
+        "user_tz_str":          "UTC",   # filled from browser Intl API
+        "scoring_trigger":      None,    # "auto" | "manual" | None
+        "pending_auto_score":   False,   # True when autorefresh just fired
+        "pending_manual_score": False,   # True when Score button just clicked
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -288,17 +264,41 @@ if st.session_state.day_date != today:
     st.session_state.last_scored_hour = None
     st.session_state.zone_overridden  = False
 
-# ── Reset GPS on every autorefresh cycle so coords stay current ──────────────
-if _refresh_count != st.session_state.last_refresh_count:
-    st.session_state.gps_fetched        = False
+# ── Detect autorefresh cycle ─────────────────────────────────────────────────
+# _refresh_count increments each time st_autorefresh fires a rerun.
+# Compare to last_refresh_count — if changed, this rerun is the hourly cycle.
+_is_autorefresh_cycle = (_refresh_count != st.session_state.last_refresh_count)
+if _is_autorefresh_cycle:
     st.session_state.last_refresh_count = _refresh_count
+    st.session_state.pending_auto_score = True  # will score after GPS re-detect
 
-# ── Auto-GPS: fires once per session via streamlit-js-eval ───────────────────
-# get_geolocation() calls navigator.geolocation.getCurrentPosition in the
-# browser and returns the result directly to Python — no button needed.
-# Runs silently on first page load; never runs again once gps_fetched=True.
-if _HAS_JS_EVAL and not st.session_state.gps_fetched:
-    with st.spinner("📍 Detecting your location…"):
+# ── GPS flow ──────────────────────────────────────────────────────────────────
+# FIRST LOAD  : ask permission once. Blocks until GPS resolves or user denies.
+# AUTOREFRESH : re-detect silently using already-granted permission.
+# MANUAL SCORE: re-detect silently (pending_manual_score set by button below).
+# ALL OTHER   : use stored coords, no GPS call.
+
+if _HAS_JS_EVAL:
+    if not st.session_state.gps_permission_asked:
+        # First load — request permission and get initial fix
+        with st.spinner("Requesting your location…"):
+            try:
+                geo = get_geolocation()
+                if geo and "coords" in geo:
+                    lat = geo["coords"].get("latitude")
+                    lon = geo["coords"].get("longitude")
+                    acc = geo["coords"].get("accuracy", "?")
+                    if lat is not None and lon is not None:
+                        st.session_state.gps_lat   = round(lat, 6)
+                        st.session_state.gps_lon   = round(lon, 6)
+                        st.session_state.gps_label = f"{lat:.4f}, {lon:.4f}  ±{acc:.0f}m"
+            except Exception:
+                pass  # denied — falls back to manual sidebar coords
+        st.session_state.gps_permission_asked = True
+        st.session_state.gps_fetched          = True
+
+    elif _is_autorefresh_cycle or st.session_state.pending_manual_score:
+        # Hourly autorefresh or Score button — silently re-detect
         try:
             geo = get_geolocation()
             if geo and "coords" in geo:
@@ -308,12 +308,14 @@ if _HAS_JS_EVAL and not st.session_state.gps_fetched:
                 if lat is not None and lon is not None:
                     st.session_state.gps_lat   = round(lat, 6)
                     st.session_state.gps_lon   = round(lon, 6)
-                    st.session_state.gps_label = (
-                        f"{lat:.4f}, {lon:.4f}  ±{acc:.0f}m"
-                    )
+                    st.session_state.gps_label = f"{lat:.4f}, {lon:.4f}  ±{acc:.0f}m"
         except Exception:
-            pass  # GPS denied or not available — falls back to manual sidebar
-    st.session_state.gps_fetched = True
+            pass  # keep last known coords
+        st.session_state.gps_fetched = True
+else:
+    # No streamlit-js-eval — use sidebar manual coords
+    st.session_state.gps_permission_asked = True
+    st.session_state.gps_fetched          = True
 
 # ── Always-on autorefresh (must be called before any widget) ────────────────
 # Fires a full rerun every 60 min regardless of toggle.
@@ -328,7 +330,7 @@ with st.sidebar:
 
     # Secrets — loaded once; never reset the toggle after first run
     _secrets    = getattr(st, "secrets", {})
-    default_owm    = _secrets.get("OWM_API_KEY",    "")
+    default_owm    = _secrets.get("AIRNOW_API_KEY", "")
     default_google = _secrets.get("GOOGLE_API_KEY", "")
 
     # First run: default mock OFF if keys are present in secrets, ON otherwise
@@ -343,12 +345,22 @@ with st.sidebar:
     use_mock = _mock_toggled
 
     if not use_mock:
-        owm_key    = st.text_input("OpenWeatherMap API key", value=default_owm,    type="password")
-        google_key = st.text_input("Google Pollen API key",  value=default_google, type="password")
-        if not owm_key or not google_key:
-            st.warning("Enter both keys or enable mock mode.")
-            st.session_state.use_mock = True
-            use_mock = True
+        # If keys are already loaded from st.secrets, show a confirmation badge
+        # and never render the input fields (keys stay hidden).
+        # Only show input fields when keys are NOT in secrets.
+        if default_owm and default_google:
+            st.success("🔑 API keys loaded from Streamlit secrets")
+            owm_key    = default_owm   # AirNow key
+            google_key = default_google
+        else:
+            owm_key    = st.text_input("AirNow API key", value="", type="password",
+                                       placeholder="Paste your AirNow key here")
+            google_key = st.text_input("Google Pollen API key",  value="", type="password",
+                                       placeholder="Paste your Google key here")
+            if not owm_key or not google_key:  # AirNow key required
+                st.warning("Enter both keys or enable mock mode.")
+                st.session_state.use_mock = True
+                use_mock = True
     else:
         owm_key    = ""
         google_key = ""
@@ -382,7 +394,7 @@ with st.sidebar:
     else:
         st.warning("⚠ Install `streamlit-autorefresh` to enable auto-scoring.")
     if st.session_state.last_scored:
-        st.caption(f"Last scored: {st.session_state.last_scored.strftime('%H:%M:%S')}")
+        st.caption(f"Last scored: {st.session_state.last_scored.strftime('%H:%M:%S')} {st.session_state.user_tz_str}")
 
     st.divider()
     if st.button("🗑 Clear today's history"):
@@ -394,7 +406,7 @@ with st.sidebar:
     st.markdown("""
 <small style='color:#555'>
 ECS v1.0 · DALY-weighted<br>
-Data: OWM + Google Pollen<br>
+Data: AirNow EPA + Google Pollen<br>
 Infiltration: Chen & Zhao 2011
 </small>
 """, unsafe_allow_html=True)
@@ -478,10 +490,11 @@ def _to_display(key: str, engine_val: float) -> tuple:
         who  = round(who_eng    / _O3_PPB,  1) if who_eng else None
         return val, "ppb", who, "ppb"
     elif key == "co":
-        # Engine stores CO in mg/m³
-        val  = round(engine_val * 1000.0 / _CO_PPB, 0)
-        who  = round(who_eng    * 1000.0 / _CO_PPB, 0) if who_eng else None
-        return int(val), "ppb", int(who) if who else None, "ppb"
+        # Engine stores CO in mg/m³. 1 ppm CO = 1.145 mg/m³ at 25°C, 1 atm.
+        # ppm = mg/m³ ÷ 1.145
+        val  = round(engine_val / _CO_PPB, 2)
+        who  = round(who_eng    / _CO_PPB, 2) if who_eng else None
+        return val, "ppm", who, "ppm"
     elif key == "pm25":
         return round(engine_val, 1), "µg/m³", who_eng, "µg/m³"
     elif key == "pm10":
@@ -535,9 +548,9 @@ def _color_for_score(score: float) -> str:
 
 def _get_assembler():
     if use_mock:
-        return PollutantAssembler(owm_client=MockOWMClient(), pollen_client=MockPollenClient())
+        return PollutantAssembler(owm_client=MockAirNowClient(), pollen_client=MockPollenClient())
     return PollutantAssembler(
-        owm_client    = OpenWeatherMapClient(api_key=owm_key),
+        owm_client    = AirNowClient(api_key=owm_key),
         pollen_client = GooglePollenClient(api_key=google_key),
     )
 
@@ -554,7 +567,15 @@ def _effective_coords():
         return st.session_state.gps_lat, st.session_state.gps_lon
     return manual_lat, manual_lon
 
-def _score_now():
+def _score_now(overwrite: bool = False):
+    """
+    Score the current hour and write to history.
+
+    overwrite=False (auto): always appends a new entry for this hour.
+        Multiple auto-scores in the same hour all appear in history.
+    overwrite=True  (manual 'Score this hour' button): replaces the existing
+        entry for this hour so only one entry per hour exists.
+    """
     lat, lon     = _effective_coords()
     local_dt     = _local_now()
     hour         = local_dt.hour
@@ -569,7 +590,7 @@ def _score_now():
             lat              = lat,
             lon              = lon,
             zone             = zone,
-            indoor_overrides = None,   # no sensors — outdoor AQ x infiltration only
+            indoor_overrides = None,
         )
     except Exception as e:
         st.error(f"Data fetch failed: {e}")
@@ -578,33 +599,41 @@ def _score_now():
     reading = HourlyReading(
         timestamp            = hour,
         pollutants           = assembly.pollutants,
-        biomarkers           = None,    # wearable integration added later
+        biomarkers           = None,
         in_sleep_window      = in_sleep,
         protection_confirmed = False,
     )
 
     result = compute_hourly_ECS(reading, engine_state)
 
-    # Store raw API readings alongside scores so history charts have real data
     entry = {
-        "hour":      hour,
-        "ecs":       result["ECS"],
-        "A":         result["A"],
-        "B":         result["B"],
-        "C":         result["C"],
-        "D":         result["D"],
-        "ts":        local_dt.strftime("%H:%M"),
-        "zone":      zone_str,
-        "offending": result.get("offending", []),
-        "streak":    result.get("exposure_streak", 0),
-        "penalty":   result.get("penalty_pts", 0),
-        "raw":       {**assembly.outdoor_raw, **assembly.pollen_raw},
-        "indoor":    dict(assembly.pollutants),
+        "hour":       hour,
+        "ecs":        result["ECS"],
+        "A":          result["A"],
+        "B":          result["B"],
+        "C":          result["C"],
+        "D":          result["D"],
+        "ts":         local_dt.strftime("%H:%M"),
+        "scored_at":  local_dt.strftime("%H:%M:%S"),
+        "zone":       zone_str,
+        "offending":  result.get("offending", []),
+        "streak":     result.get("exposure_streak", 0),
+        "penalty":    result.get("penalty_pts", 0),
+        "raw":        {**assembly.outdoor_raw, **assembly.pollen_raw},
+        "indoor":     dict(assembly.pollutants),
         "backfilled": False,
+        "manual":     overwrite,
     }
-    history = [h for h in st.session_state.history if h["hour"] != hour]
+
+    if overwrite:
+        # Manual press — replace existing entry for this hour
+        history = [h for h in st.session_state.history if h["hour"] != hour]
+    else:
+        # Auto-score — keep all existing entries, just append new one
+        history = list(st.session_state.history)
+
     history.append(entry)
-    history.sort(key=lambda x: x["hour"])
+    history.sort(key=lambda x: (x["hour"], x.get("scored_at", "")))
     st.session_state.history          = history
     st.session_state.last_result      = result
     st.session_state.last_assembly    = assembly
@@ -617,7 +646,7 @@ def _score_now():
 def _backfill_missing_hours():
     """
     Called on app open when hours have been missed (browser was closed).
-    Uses OWM historical API to fetch AQ for each missed hour and scores them.
+    Uses AirNow historical API to fetch AQ for each missed hour and scores them.
     Pollen is held constant at today's value (Google Pollen is daily only).
     Silently fills history so user sees a complete picture when they return.
     Only backfills within the current ECS day (07:00 boundary).
@@ -727,18 +756,20 @@ def _backfill_missing_hours():
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Backfill missed hours (silently, before rendering) ───────────────────────
-# If the browser was closed and hours were missed, fetch OWM historical data
+# If the browser was closed and hours were missed, fetch AirNow historical data
 # and score each missed hour so history is complete when user returns.
 if (st.session_state.last_scored_hour is not None
         and st.session_state.last_scored_hour != _now.hour):
     _backfill_missing_hours()
 
-# ── Auto-score trigger ────────────────────────────────────────────────────────
-# Score when: (a) no result yet, or (b) current hour differs from last scored hour
-_need_score = (
-    st.session_state.last_result is None
-    or st.session_state.last_scored_hour != _now.hour
-)
+# ── Scoring trigger logic ────────────────────────────────────────────────────
+# Three cases that cause a score:
+#   1. First ever load — no result yet → auto-score
+#   2. Hourly autorefresh fired        → auto-score (new entry, no overwrite)
+#   3. User clicked "Score this hour"  → manual score (overwrite current hour)
+# All other reruns (zone change, sidebar, mid-hour refresh) → no scoring.
+_is_first_load   = st.session_state.last_result is None
+_need_auto_score = _is_first_load or st.session_state.pending_auto_score
 
 # ── Title ─────────────────────────────────────────────────────────────────────
 st.markdown("## 🌿 Environmental Capital Score")
@@ -809,6 +840,9 @@ st.markdown("")
 col_score, col_time = st.columns([1, 2])
 with col_score:
     score_now = st.button("⚡ Score this hour", type="primary", use_container_width=True)
+    if score_now:
+        # Mark that the button was pressed — GPS will re-detect this rerun
+        st.session_state.pending_manual_score = True
 with col_time:
     sleep_flag = "🌙 Sleep window" if _is_sleep_window(_now.hour) else ""
     st.markdown(
@@ -817,11 +851,21 @@ with col_time:
         unsafe_allow_html=True,
     )
 
-# Score on: manual button press, first load, or start of a new hour
-if score_now or _need_score:
+# ── Execute scoring ────────────────────────────────────────────────────────────
+if st.session_state.pending_manual_score:
+    # Manual press — re-detect GPS already done above, now overwrite this hour
     with st.spinner("Fetching air quality and pollen…"):
-        result, assembly = _score_now()
+        result, assembly = _score_now(overwrite=True)
+    st.session_state.pending_manual_score = False
+
+elif _need_auto_score:
+    # Auto-score: first load or hourly autorefresh
+    with st.spinner("Fetching air quality and pollen…"):
+        result, assembly = _score_now(overwrite=False)
+    st.session_state.pending_auto_score = False
+
 else:
+    # Regular rerun (zone change, sidebar toggle, etc.) — just re-render
     result   = st.session_state.last_result
     assembly = st.session_state.last_assembly
 
@@ -912,21 +956,14 @@ if result is not None:
         st.markdown("#### Pollutant breakdown")
         is_indoor = assembly.is_indoor
 
-        DISPLAY_UNITS = {
-            "pm25": "µg/m³", "pm10": "µg/m³", "no2": "µg/m³",
-            "o3": "µg/m³", "co": "mg/m³",
-            "pollen_tree": "grains/m³", "pollen_grass": "grains/m³", "pollen_weed": "grains/m³",
-            "co2": "ppm", "radon": "Bq/m³", "humidity": "%", "temp": "°C",
-        }
         DISPLAY_NAMES = {
             "pm25": "PM2.5", "pm10": "PM10", "no2": "NO₂", "o3": "O₃", "co": "CO",
             "pollen_tree": "Tree pollen", "pollen_grass": "Grass pollen", "pollen_weed": "Weed pollen",
             "co2": "CO₂", "radon": "Radon", "humidity": "Humidity", "temp": "Temperature",
         }
 
-        # Sensor-only pollutants — always show in table, blank if no sensor data
+        # Sensor-only pollutants — always show, blank if no sensor data
         SENSOR_ONLY_KEYS = ["co2", "radon", "humidity", "temp"]
-        SENSOR_UNITS     = {"co2": "ppm", "radon": "Bq/m³", "humidity": "%", "temp": "°C"}
 
         rows = ""
         for key, final_val in sorted(assembly.pollutants.items()):
@@ -936,8 +973,8 @@ if result is not None:
             factor  = INFILTRATION_FACTORS.get(key)
 
             # Convert to display units (ppb for NO2/O3, ppm for CO, unchanged for rest)
-            disp_final, unit, who_disp = _display_val(key, final_val)
-            disp_outdoor = round(outdoor * UNIT_CONVERT[key]["factor"], 2) if (outdoor is not None and key in UNIT_CONVERT) else outdoor
+            disp_final, unit, who_disp, _ = _to_display(key, final_val)
+            disp_outdoor = round(_to_display(key, outdoor)[0], 2) if outdoor is not None else None
             who_str = f"{who_disp}" if who_disp is not None else "—"
 
             # For pollen: WHO comparison uses outdoor raw (indoor heavily attenuated)
@@ -977,8 +1014,8 @@ if result is not None:
                 if key in assembly.pollutants:
                     continue  # already shown above
                 name     = DISPLAY_NAMES.get(key, key)
-                _, unit, who_disp = _display_val(key, 0)
-                who_str  = f"{who_disp}" if who_disp is not None else "—"  if who is not None else "—"
+                _, unit, who_disp, _u = _to_display(key, 0)
+                who_str  = f"{who_disp}" if who_disp is not None else "—"
                 rows += f"""
 <tr style="color:#555;font-style:italic">
   <td>{name}</td>
@@ -1019,21 +1056,22 @@ if result is not None:
 
         # ── Backend inspector ─────────────────────────────────────────────────
         with st.expander("🔬 Backend — raw data & assembly log"):
-            st.markdown("**Outdoor API (raw)**")
+            st.markdown("**Outdoor API (raw — converted to display units)**")
             raw_cols = st.columns(len(assembly.outdoor_raw))
             for i, (k, v) in enumerate(assembly.outdoor_raw.items()):
-                raw_cols[i].metric(DISPLAY_NAMES.get(k, k), f"{v}", help=f"{DISPLAY_UNITS.get(k,'')}")
+                dv, du, dw, _ = _to_display(k, v)
+                raw_cols[i].metric(DISPLAY_NAMES.get(k, k), f"{dv} {du}")
 
             st.markdown("**Pollen API (raw)**")
             pol_cols = st.columns(len(assembly.pollen_raw))
             for i, (k, v) in enumerate(assembly.pollen_raw.items()):
-                who_p = WHO_THRESHOLDS.get(k, "?")
+                dv, du, dw, _ = _to_display(k, v)
+                who_str = f"WHO: {dw} {du}" if dw else ""
                 pol_cols[i].metric(
                     DISPLAY_NAMES.get(k, k),
-                    f"{v}",
-                    delta=f"WHO limit: {who_p}",
+                    f"{dv} {du}",
+                    delta=who_str,
                     delta_color="off",
-                    help=f"{DISPLAY_UNITS.get(k,'')}"
                 )
 
             if assembly.source_notes:
@@ -1044,7 +1082,7 @@ if result is not None:
             if assembly.missing_outdoor:
                 st.warning(f"Possible API gaps (returned 0): {', '.join(assembly.missing_outdoor)}")
 
-            st.markdown("**Full pollutants dict sent to engine**")
+            st.markdown("**Full pollutants dict sent to engine (engine units)**")
             st.json(assembly.pollutants)
 
 # ── History chart ─────────────────────────────────────────────────────────────
@@ -1219,7 +1257,7 @@ else:
         st.line_chart(df)
 
     if any(h.get("backfilled") for h in history):
-        st.caption("↩ = backfilled from OWM historical data while browser was closed")
+        st.caption("↩ = backfilled from AirNow historical data while browser was closed")
 
     # ── Per-hour table — always visible, expandable detail per row ─────────
     DISPLAY_NAMES_SHORT = {
@@ -1263,8 +1301,8 @@ else:
                 ind_val  = indoor.get(key)
                 who_lim  = WHO_SHORT.get(key, "—")
                 # Convert display units
-                disp_raw, unit_str, who_disp = _display_val(key, raw_val if raw_val is not None else 0)
-                disp_ind, _, _               = _display_val(key, ind_val if ind_val is not None else 0)
+                disp_raw, unit_str, who_disp, _ = _to_display(key, raw_val if raw_val is not None else 0)
+                disp_ind, _u, _w, _wu        = _to_display(key, ind_val if ind_val is not None else 0)
                 who_lim  = who_disp
 
                 raw_str = f"{disp_raw}" if raw_val is not None else "—"

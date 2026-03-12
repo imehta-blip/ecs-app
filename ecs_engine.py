@@ -446,7 +446,7 @@ def exceeds_sleep_threshold(pollutant, value):
     return value > t
 
 def compute_component_D(pollutants, sleep_history, in_sleep):
-    if not in_sleep: return 0.5
+    if not in_sleep: return 0.0   # D only active during sleep window (22:00-06:59)
     if not sleep_history:
         n_ok = sum(1 for p in SLEEP_POLLUTANTS
                    if p in pollutants and not exceeds_sleep_threshold(p, pollutants[p]))
