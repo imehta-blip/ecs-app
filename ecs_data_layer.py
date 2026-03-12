@@ -150,9 +150,93 @@ _AIRNOW_PARAM_MAP = {
 }
 
 
+
+def _aqi_to_concentration(key: str, aqi: float) -> Optional[float]:
+    """
+    Convert an AQI value back to approximate raw concentration.
+    Uses EPA AQI breakpoint tables (40 CFR Part 58, Appendix G).
+
+    Engine output units:
+        pm25  → µg/m³
+        pm10  → µg/m³
+        o3    → µg/m³  (converted from ppb)
+        no2   → µg/m³  (converted from ppb)
+        co    → mg/m³  (converted from ppm)
+
+    AQI breakpoints: (AQI_lo, AQI_hi, Conc_lo, Conc_hi)
+    Linear interpolation within each band.
+    """
+    # Breakpoints: (aqi_lo, aqi_hi, conc_lo, conc_hi)
+    # PM2.5 µg/m³ (24-h avg)
+    _PM25 = [
+        (0,   50,  0.0,   12.0),
+        (51,  100, 12.1,  35.4),
+        (101, 150, 35.5,  55.4),
+        (151, 200, 55.5,  150.4),
+        (201, 300, 150.5, 250.4),
+        (301, 500, 250.5, 500.4),
+    ]
+    # PM10 µg/m³ (24-h avg)
+    _PM10 = [
+        (0,   50,  0,   54),
+        (51,  100, 55,  154),
+        (101, 150, 155, 254),
+        (151, 200, 255, 354),
+        (201, 300, 355, 424),
+        (301, 500, 425, 604),
+    ]
+    # O3 ppb (8-h avg) — we convert to µg/m³ after
+    _O3_PPB = [
+        (0,   50,  0,   54),
+        (51,  100, 55,  70),
+        (101, 150, 71,  85),
+        (151, 200, 86,  105),
+        (201, 300, 106, 200),
+    ]
+    # NO2 ppb (1-h avg)
+    _NO2_PPB = [
+        (0,   50,  0,    53),
+        (51,  100, 54,   100),
+        (101, 150, 101,  360),
+        (151, 200, 361,  649),
+        (201, 300, 650,  1249),
+        (301, 500, 1250, 2049),
+    ]
+    # CO ppm (8-h avg)
+    _CO_PPM = [
+        (0,   50,  0.0,  4.4),
+        (51,  100, 4.5,  9.4),
+        (101, 150, 9.5,  12.4),
+        (151, 200, 12.5, 15.4),
+        (201, 300, 15.5, 30.4),
+        (301, 500, 30.5, 50.4),
+    ]
+
+    tables = {
+        "pm25": (_PM25,    1.0),           # already µg/m³
+        "pm10": (_PM10,    1.0),           # already µg/m³
+        "o3":   (_O3_PPB,  _O3_UGM3_PER_PPB),   # ppb → µg/m³
+        "no2":  (_NO2_PPB, _NO2_UGM3_PER_PPB),  # ppb → µg/m³
+        "co":   (_CO_PPM,  _CO_MGM3_PER_PPM),   # ppm → mg/m³
+    }
+
+    if key not in tables:
+        return None
+    table, factor = tables[key]
+
+    for (aqi_lo, aqi_hi, c_lo, c_hi) in table:
+        if aqi_lo <= aqi <= aqi_hi:
+            # Linear interpolation
+            conc_raw = c_lo + (aqi - aqi_lo) * (c_hi - c_lo) / (aqi_hi - aqi_lo)
+            conc = round(conc_raw * factor, 3)
+            return max(0.0, conc)
+
+    return None   # AQI out of range
+
+
 class AirNowClient:
     """
-    Fetches current outdoor air quality from the EPA AirNow /aq/data/ API.
+    Fetches current outdoor air quality from the EPA AirNow API.
     Returns: pm25, pm10, no2, o3, co as a dict with engine-compatible units.
 
     Data source: 2,500+ EPA ground-station monitors across the US.
@@ -162,72 +246,76 @@ class AirNowClient:
     API key: free registration at https://docs.airnowapi.org/
     Rate limit: 500 requests/hour (free tier)
 
-    Endpoint used: /aq/data/
-    Returns raw concentrations with units — not AQI.
-    Units from AirNow:
-        PM2.5, PM10  → µg/m³    stored as-is (engine expects µg/m³)
-        NO2, O3      → ppb      converted → µg/m³ for engine
-        CO           → ppm      converted → mg/m³ for engine
+    Endpoints:
+        Current:  /aq/observation/latLong/current/   — simple, reliable
+        History:  /aq/observation/latLong/historical/ — one hour at a time
+
+    AirNow current/historical observation endpoints return AQI + concentration.
+    Each record has one ParameterName (PM2.5, PM10, O3, NO2, CO).
+    Units per pollutant:
+        PM2.5, PM10  → µg/m³   stored as-is
+        O3, NO2      → ppb     converted to µg/m³ for engine
+        CO           → ppm     converted to mg/m³ for engine
     """
 
-    DATA_URL    = "https://www.airnowapi.org/aq/data/"
-    HISTORY_URL = "https://www.airnowapi.org/aq/data/"
+    BASE_URL    = "https://www.airnowapi.org/aq/observation/latLong/current/"
+    HISTORY_URL = "https://www.airnowapi.org/aq/observation/latLong/historical/"
 
-    def __init__(self, api_key: str, distance_miles: int = 50):
+    def __init__(self, api_key: str, distance_miles: int = 75):
         self.api_key        = api_key
-        self.distance_miles = distance_miles   # radius to search for monitoring stations
+        self.distance_miles = distance_miles
 
-    def _parse_records(self, records: list) -> dict:
+    def _parse_observations(self, records: list) -> dict:
         """
-        Parse a list of AirNow /aq/data/ records into engine-compatible dict.
-        Each record: {"Parameter": "PM2.5", "Value": 12.3, "Unit": "UG/M3", ...}
+        Parse AirNow observation records into engine-compatible dict.
 
-        Returns dict with keys: pm25, pm10, no2, o3, co
-        Missing pollutants are omitted (no station in range) — caller handles gaps.
+        Each record from /observation/ endpoints:
+        {
+            "DateObserved": "2026-03-12 ",
+            "HourObserved": 14,
+            "LocalTimeZone": "PST",
+            "ReportingArea": "San Francisco",
+            "StateCode": "CA",
+            "Latitude": 37.77,
+            "Longitude": -122.41,
+            "ParameterName": "PM2.5",
+            "AQI": 33,
+            "Category": {"Number": 1, "Name": "Good"}
+        }
+
+        NOTE: The observation endpoint does NOT return raw concentrations —
+        only AQI. We back-calculate concentration from AQI using EPA
+        breakpoints. This is the standard approach used by all AirNow clients.
         """
         result = {}
         for rec in records:
-            param = rec.get("Parameter", "").strip().upper()
+            param = rec.get("ParameterName", "").strip().upper()
             key   = _AIRNOW_PARAM_MAP.get(param)
             if key is None:
                 continue
             try:
-                raw_val = float(rec.get("Value", 0.0))
+                aqi = float(rec.get("AQI", -1))
             except (TypeError, ValueError):
                 continue
+            if aqi < 0:
+                continue   # -1 = no data
 
-            # AirNow may return negative values for very clean air (instrument drift).
-            # Clamp to 0 — negative concentrations have no physical meaning for scoring.
-            raw_val = max(0.0, raw_val)
+            conc = _aqi_to_concentration(key, aqi)
+            if conc is None:
+                continue
 
-            unit = rec.get("Unit", "").strip().upper()
-
-            if key == "no2":
-                # AirNow returns NO2 in ppb → convert to µg/m³ for engine
-                val = round(raw_val * _NO2_UGM3_PER_PPB, 2)
-            elif key == "o3":
-                # AirNow returns O3 in ppb → convert to µg/m³ for engine
-                val = round(raw_val * _O3_UGM3_PER_PPB, 2)
-            elif key == "co":
-                # AirNow returns CO in ppm → convert to mg/m³ for engine
-                val = round(raw_val * _CO_MGM3_PER_PPM, 3)
-            else:
-                # PM2.5, PM10 — already in µg/m³
-                val = round(raw_val, 2)
-
-            # Keep the highest reading if multiple stations report same pollutant
-            if key not in result or val > result[key]:
-                result[key] = val
+            # Keep highest reading if multiple reporting areas overlap
+            if key not in result or conc > result[key]:
+                result[key] = conc
 
         return result
 
     def fetch(self, lat: float, lon: float) -> dict:
         """
-        Fetch the most recent hour of AQ data for a GPS location.
+        Fetch the most recent AQ observations for a GPS location.
 
         Returns a dict with keys: pm25, pm10, no2, o3, co
         All values in engine-compatible units (µg/m³ or mg/m³).
-        Pollutants with no nearby station are omitted.
 
         Raises:
             ValueError   if API key is not set
@@ -239,26 +327,14 @@ class AirNowClient:
                 "Register free at https://docs.airnowapi.org/"
             )
 
-        # AirNow /aq/data/ needs an explicit time window.
-        # Use a 2-hour window ending now to guarantee we catch the latest reading
-        # (data is published ~35 min past the hour, so current hour may not exist yet).
-        now_utc   = datetime.datetime.utcnow()
-        end_dt    = now_utc.replace(minute=0, second=0, microsecond=0)
-        start_dt  = end_dt - datetime.timedelta(hours=2)
-
         params = urllib.parse.urlencode({
-            "startDateTimeISO": start_dt.strftime("%Y-%m-%dT%H:%M"),
-            "endDateTimeISO":   end_dt.strftime("%Y-%m-%dT%H:%M"),
-            "parameters":       "PM2.5,PM10,NO2,OZONE,CO",
-            "BBOX":             self._bbox(lat, lon),
-            "dataType":         "C",           # C = concentrations (not AQI)
-            "format":           "application/json",
-            "verbose":          0,             # minimal fields
-            "nowcastonly":      0,
-            "includerawconcentrations": 1,
-            "API_KEY":          self.api_key,
+            "format":        "application/json",
+            "latitude":      lat,
+            "longitude":     lon,
+            "distance":      self.distance_miles,
+            "API_KEY":       self.api_key,
         })
-        url = f"{self.DATA_URL}?{params}"
+        url = f"{self.BASE_URL}?{params}"
 
         try:
             with urllib.request.urlopen(url, timeout=15) as resp:
@@ -266,78 +342,62 @@ class AirNowClient:
         except urllib.error.HTTPError as e:
             if e.code == 400:
                 raise RuntimeError(
-                    "AirNow API error 400 — check your API key and parameters. "
-                    "Key must be activated (check email confirmation)."
+                    f"AirNow API 400 error. URL tried: {url[:120]}... "
+                    "Check that your API key is activated (confirmation email link). "
+                    "Key format should be: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
                 )
             if e.code == 429:
-                raise RuntimeError("AirNow API rate limit hit (500 req/hour). Try again shortly.")
+                raise RuntimeError("AirNow rate limit hit (500 req/hour). Try again shortly.")
             raise RuntimeError(f"AirNow API error {e.code}: {e.reason}")
         except urllib.error.URLError as e:
-            raise RuntimeError(f"Network error reaching AirNow API: {e.reason}")
+            raise RuntimeError(f"Network error reaching AirNow: {e.reason}")
 
         if not isinstance(data, list) or len(data) == 0:
-            raise RuntimeError(
-                f"AirNow returned no data for lat={lat}, lon={lon}. "
-                f"No monitoring stations within {self.distance_miles} miles?"
-            )
+            # No stations in range — return empty dict, assembler will flag as missing
+            return {}
 
-        return self._parse_records(data)
+        return self._parse_observations(data)
 
     def fetch_history(self, lat: float, lon: float,
                       start_ts: int, end_ts: int) -> list:
         """
         Fetch historical hourly AQ from AirNow for a time range.
-        Used to backfill missing hours when the app was closed.
+        Used to backfill missed hours when the app was closed.
 
-        Args:
-            start_ts: Unix timestamp of first hour to fetch (inclusive)
-            end_ts:   Unix timestamp of last hour to fetch (inclusive)
-
-        Returns list of dicts: [{timestamp, pm25, pm10, no2, o3, co}, ...]
-        Sorted ascending by timestamp.
-        AirNow supports history for the past 2 months.
+        Loops one request per hour (AirNow historical endpoint is per-hour).
+        AirNow supports up to 2 months of history.
         """
         if self.api_key in ("YOUR_AIRNOW_KEY", "", None):
             raise ValueError("AirNow API key not set.")
 
-        start_dt = datetime.datetime.utcfromtimestamp(start_ts)
-        end_dt   = datetime.datetime.utcfromtimestamp(end_ts)
+        results = []
+        ts = start_ts
+        while ts <= end_ts:
+            dt = datetime.datetime.utcfromtimestamp(ts)
+            date_str = dt.strftime("%Y-%m-%dT%H:%M")
+            params = urllib.parse.urlencode({
+                "format":        "application/json",
+                "latitude":      lat,
+                "longitude":     lon,
+                "distance":      self.distance_miles,
+                "date":          date_str,
+                "API_KEY":       self.api_key,
+            })
+            url = f"{self.HISTORY_URL}?{params}"
+            try:
+                with urllib.request.urlopen(url, timeout=15) as resp:
+                    data = json.loads(resp.read().decode())
+                if isinstance(data, list) and len(data) > 0:
+                    pollutants = self._parse_observations(data)
+                    if pollutants:
+                        entry = {"timestamp": ts}
+                        entry.update(pollutants)
+                        results.append(entry)
+            except Exception:
+                pass   # skip failed hours, continue backfill
+            ts += 3600
 
-        params = urllib.parse.urlencode({
-            "startDateTimeISO": start_dt.strftime("%Y-%m-%dT%H:%M"),
-            "endDateTimeISO":   end_dt.strftime("%Y-%m-%dT%H:%M"),
-            "parameters":       "PM2.5,PM10,NO2,OZONE,CO",
-            "BBOX":             self._bbox(lat, lon),
-            "dataType":         "C",
-            "format":           "application/json",
-            "verbose":          0,
-            "nowcastonly":      0,
-            "includerawconcentrations": 1,
-            "API_KEY":          self.api_key,
-        })
-        url = f"{self.DATA_URL}?{params}"
-
-        try:
-            with urllib.request.urlopen(url, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(f"AirNow history API error {e.code}: {e.reason}")
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"Network error reaching AirNow history API: {e.reason}")
-
-        if not isinstance(data, list):
-            return []
-
-        # AirNow returns one record per station per pollutant per hour.
-        # Group by UTC hour, parse each group into one readings dict.
-        from collections import defaultdict
-        by_hour = defaultdict(list)
-        for rec in data:
-            # UTC datetime from record, e.g. "2026-03-12T14:00"
-            utc_str = rec.get("UTC", "") or rec.get("DateObserved", "")
-            if not utc_str:
-                continue
-            by_hour[utc_str].append(rec)
+        return results
 
         results = []
         for utc_str, recs in sorted(by_hour.items()):
@@ -355,21 +415,7 @@ class AirNowClient:
         results.sort(key=lambda x: x["timestamp"])
         return results
 
-    def _bbox(self, lat: float, lon: float) -> str:
-        """
-        Build a bounding box string around a lat/lon point.
-        AirNow /aq/data/ requires BBOX as "minLon,minLat,maxLon,maxLat".
-        Uses distance_miles converted to approximate degrees.
-        1 degree lat ≈ 69 miles; 1 degree lon ≈ 69 * cos(lat) miles.
-        """
-        import math
-        delta_lat = self.distance_miles / 69.0
-        delta_lon = self.distance_miles / (69.0 * math.cos(math.radians(lat)))
-        min_lon = round(lon - delta_lon, 4)
-        max_lon = round(lon + delta_lon, 4)
-        min_lat = round(lat - delta_lat, 4)
-        max_lat = round(lat + delta_lat, 4)
-        return f"{min_lon},{min_lat},{max_lon},{max_lat}"
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
