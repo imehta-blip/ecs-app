@@ -5,20 +5,20 @@ Fetches real outdoor air quality and pollen data and assembles
 the pollutants dict the ECS Engine expects.
 
 THREE COMPONENTS:
-  1. AirNowClient        — outdoor AQ via EPA AirNow /aq/data/ endpoint
-                           pm25, pm10, no2, o3, co — US ground station network
+  1. GoogleAirQualityClient — outdoor AQ via Google Air Quality API
+                             pm25, pm10, no2, o3, co — 500×500m resolution, global
   2. GooglePollenClient  — pollen: tree, grass, weed
   3. PollutantAssembler  — combines outdoor + indoor sources based on
                            location zone, applying infiltration factors
                            when the person is indoors.
 
-DATA SOURCE — AirNow (EPA):
-  Over 2,500 EPA ground-station monitors across the US.
-  Same data used by Apple Weather, AirVisual, and the US government
-  for official AQ reporting. Updated hourly (~35 min past the hour).
-  Free API key from https://docs.airnowapi.org/
+DATA SOURCE — Google Air Quality API:
+  CAMS (Copernicus Atmosphere Monitoring Service) model, same source
+  used by Apple Weather. 500×500m resolution globally, updated hourly.
+  Same GOOGLE_API_KEY as Pollen API — enable 'Air Quality API' in
+  Google Cloud Console. Free tier: 10,000 calls/month.
 
-  Uses the /aq/data/ endpoint which returns raw concentrations:
+  Returns raw concentrations via POLLUTANT_CONCENTRATION computation:
     PM2.5, PM10  → µg/m³   (stored as-is, engine expects µg/m³)
     NO2, O3      → ppb      (converted to µg/m³ for engine)
     CO           → ppm      (converted to mg/m³ for engine)
@@ -27,10 +27,6 @@ DATA SOURCE — AirNow (EPA):
     NO2: 1 ppb = 1.88 µg/m³   (MW 46 g/mol)
     O3:  1 ppb = 1.96 µg/m³   (MW 48 g/mol)
     CO:  1 ppm = 1.145 mg/m³  (MW 28 g/mol)
-
-  AirNow only reports pollutants measured at nearby stations.
-  If a pollutant has no station within distance_miles, it is omitted
-  and the assembler treats it as 0 (missing_outdoor will flag it).
 
 LOCATION LOGIC:
   OUTDOOR / COMMUTE zone → outdoor API values only — PM2.5, PM10, NO2, O3,
@@ -56,9 +52,9 @@ Sources:
   WHO 2010 — WHO guidelines for indoor air quality
 
 USAGE:
-  airnow = AirNowClient(api_key="YOUR_AIRNOW_KEY")
+  aq     = GoogleAirQualityClient(api_key="YOUR_GOOGLE_KEY")
   pollen = GooglePollenClient(api_key="YOUR_GOOGLE_KEY")
-  assembler = PollutantAssembler(owm_client=airnow, pollen_client=pollen)
+  assembler = PollutantAssembler(owm_client=aq, pollen_client=pollen)
 
   # One call — returns engine-ready dict
   result = assembler.get(
@@ -132,7 +128,7 @@ DEFAULT_INDOOR_OVERRIDES = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. AirNow Air Quality Client (EPA)
+# 1. Google Air Quality Client
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Unit conversion constants (at 25°C, 1 atm)
@@ -140,281 +136,227 @@ _NO2_UGM3_PER_PPB  = 1.88    # NO2: 1 ppb = 1.88 µg/m³  (MW 46 g/mol)
 _O3_UGM3_PER_PPB   = 1.96    # O3:  1 ppb = 1.96 µg/m³  (MW 48 g/mol)
 _CO_MGM3_PER_PPM   = 1.145   # CO:  1 ppm = 1.145 mg/m³ (MW 28 g/mol)
 
-# AirNow ParameterName strings → engine keys
-_AIRNOW_PARAM_MAP = {
-    "PM2.5": "pm25",
-    "PM10":  "pm10",
-    "NO2":   "no2",
-    "OZONE": "o3",
-    "CO":    "co",
+# Google Air Quality API pollutant codes → engine keys
+_GAQ_PARAM_MAP = {
+    "pm25":  "pm25",
+    "pm10":  "pm10",
+    "no2":   "no2",
+    "o3":    "o3",
+    "co":    "co",
 }
 
+# Google concentration units → whether we need to convert
+# Google returns: µg/m³ for PM, ppb for NO2/O3, ppm for CO
+_GAQ_UNIT_NEEDS_CONVERT = {"ppb", "ppm"}
 
 
-def _aqi_to_concentration(key: str, aqi: float) -> Optional[float]:
+class GoogleAirQualityClient:
     """
-    Convert an AQI value back to approximate raw concentration.
-    Uses EPA AQI breakpoint tables (40 CFR Part 58, Appendix G).
+    Fetches outdoor air quality from the Google Air Quality API.
+    Returns: pm25, pm10, no2, o3, co as a dict in engine-compatible units.
 
-    Engine output units:
-        pm25  → µg/m³
-        pm10  → µg/m³
-        o3    → µg/m³  (converted from ppb)
-        no2   → µg/m³  (converted from ppb)
-        co    → mg/m³  (converted from ppm)
+    Data source: CAMS (Copernicus Atmosphere Monitoring Service) model,
+    same source used by Apple Weather. 500×500 m resolution globally.
+    Updated hourly.
 
-    AQI breakpoints: (AQI_lo, AQI_hi, Conc_lo, Conc_hi)
-    Linear interpolation within each band.
-    """
-    # Breakpoints: (aqi_lo, aqi_hi, conc_lo, conc_hi)
-    # PM2.5 µg/m³ (24-h avg)
-    _PM25 = [
-        (0,   50,  0.0,   12.0),
-        (51,  100, 12.1,  35.4),
-        (101, 150, 35.5,  55.4),
-        (151, 200, 55.5,  150.4),
-        (201, 300, 150.5, 250.4),
-        (301, 500, 250.5, 500.4),
-    ]
-    # PM10 µg/m³ (24-h avg)
-    _PM10 = [
-        (0,   50,  0,   54),
-        (51,  100, 55,  154),
-        (101, 150, 155, 254),
-        (151, 200, 255, 354),
-        (201, 300, 355, 424),
-        (301, 500, 425, 604),
-    ]
-    # O3 ppb (8-h avg) — we convert to µg/m³ after
-    _O3_PPB = [
-        (0,   50,  0,   54),
-        (51,  100, 55,  70),
-        (101, 150, 71,  85),
-        (151, 200, 86,  105),
-        (201, 300, 106, 200),
-    ]
-    # NO2 ppb (1-h avg)
-    _NO2_PPB = [
-        (0,   50,  0,    53),
-        (51,  100, 54,   100),
-        (101, 150, 101,  360),
-        (151, 200, 361,  649),
-        (201, 300, 650,  1249),
-        (301, 500, 1250, 2049),
-    ]
-    # CO ppm (8-h avg)
-    _CO_PPM = [
-        (0,   50,  0.0,  4.4),
-        (51,  100, 4.5,  9.4),
-        (101, 150, 9.5,  12.4),
-        (151, 200, 12.5, 15.4),
-        (201, 300, 15.5, 30.4),
-        (301, 500, 30.5, 50.4),
-    ]
+    API key: same GOOGLE_API_KEY used for the Pollen API.
+    Enable "Air Quality API" in Google Cloud Console.
+    Free tier: 10,000 calls/month (~$0 for our ~720 calls/month usage).
 
-    tables = {
-        "pm25": (_PM25,    1.0),           # already µg/m³
-        "pm10": (_PM10,    1.0),           # already µg/m³
-        "o3":   (_O3_PPB,  _O3_UGM3_PER_PPB),   # ppb → µg/m³
-        "no2":  (_NO2_PPB, _NO2_UGM3_PER_PPB),  # ppb → µg/m³
-        "co":   (_CO_PPM,  _CO_MGM3_PER_PPM),   # ppm → mg/m³
-    }
+    Endpoints (HTTP POST with JSON body):
+        Current:  /v1/currentConditions:lookup
+        History:  /v1/history:lookup
 
-    if key not in tables:
-        return None
-    table, factor = tables[key]
+    extraComputations: POLLUTANT_CONCENTRATION — returns raw concentration
+    values alongside AQI. Without this, only AQI is returned.
 
-    for (aqi_lo, aqi_hi, c_lo, c_hi) in table:
-        if aqi_lo <= aqi <= aqi_hi:
-            # Linear interpolation
-            conc_raw = c_lo + (aqi - aqi_lo) * (c_hi - c_lo) / (aqi_hi - aqi_lo)
-            conc = round(conc_raw * factor, 3)
-            return max(0.0, conc)
-
-    return None   # AQI out of range
-
-
-class AirNowClient:
-    """
-    Fetches current outdoor air quality from the EPA AirNow API.
-    Returns: pm25, pm10, no2, o3, co as a dict with engine-compatible units.
-
-    Data source: 2,500+ EPA ground-station monitors across the US.
-    Same data used by Apple Weather and official US AQ reporting.
-    Updated hourly (~35 minutes past the hour).
-
-    API key: free registration at https://docs.airnowapi.org/
-    Rate limit: 500 requests/hour (free tier)
-
-    Endpoints:
-        Current:  /aq/observation/latLong/current/   — simple, reliable
-        History:  /aq/observation/latLong/historical/ — one hour at a time
-
-    AirNow current/historical observation endpoints return AQI + concentration.
-    Each record has one ParameterName (PM2.5, PM10, O3, NO2, CO).
-    Units per pollutant:
+    Units from Google:
         PM2.5, PM10  → µg/m³   stored as-is
-        O3, NO2      → ppb     converted to µg/m³ for engine
-        CO           → ppm     converted to mg/m³ for engine
+        NO2, O3      → ppb     converted → µg/m³ for engine
+        CO           → ppm     converted → mg/m³ for engine
     """
 
-    BASE_URL    = "https://www.airnowapi.org/aq/observation/latLong/current/"
-    HISTORY_URL = "https://www.airnowapi.org/aq/observation/latLong/historical/"
+    BASE_URL    = "https://airquality.googleapis.com/v1"
+    CURRENT_URL = "/currentConditions:lookup"
+    HISTORY_URL = "/history:lookup"
 
-    def __init__(self, api_key: str, distance_miles: int = 75):
-        self.api_key        = api_key
-        self.distance_miles = distance_miles
+    def __init__(self, api_key: str):
+        self.api_key = api_key
 
-    def _parse_observations(self, records: list) -> dict:
+    def _parse_pollutants(self, pollutants_list: list) -> dict:
         """
-        Parse AirNow observation records into engine-compatible dict.
+        Parse Google Air Quality API pollutants array into engine-compatible dict.
 
-        Each record from /observation/ endpoints:
+        Each item in pollutants_list:
         {
-            "DateObserved": "2026-03-12 ",
-            "HourObserved": 14,
-            "LocalTimeZone": "PST",
-            "ReportingArea": "San Francisco",
-            "StateCode": "CA",
-            "Latitude": 37.77,
-            "Longitude": -122.41,
-            "ParameterName": "PM2.5",
-            "AQI": 33,
-            "Category": {"Number": 1, "Name": "Good"}
+            "code": "no2",
+            "displayName": "NO2",
+            "fullName": "Nitrogen Dioxide",
+            "concentration": {"value": 14.9, "units": "ppb"},
+            "additionalInfo": {...}
         }
-
-        NOTE: The observation endpoint does NOT return raw concentrations —
-        only AQI. We back-calculate concentration from AQI using EPA
-        breakpoints. This is the standard approach used by all AirNow clients.
         """
         result = {}
-        for rec in records:
-            param = rec.get("ParameterName", "").strip().upper()
-            key   = _AIRNOW_PARAM_MAP.get(param)
+        for p in pollutants_list:
+            code = p.get("code", "").lower()
+            key  = _GAQ_PARAM_MAP.get(code)
             if key is None:
                 continue
+            conc = p.get("concentration", {})
             try:
-                aqi = float(rec.get("AQI", -1))
+                raw_val = float(conc.get("value", 0.0))
             except (TypeError, ValueError):
                 continue
-            if aqi < 0:
-                continue   # -1 = no data
 
-            conc = _aqi_to_concentration(key, aqi)
-            if conc is None:
-                continue
+            raw_val = max(0.0, raw_val)   # clamp negatives
+            unit    = conc.get("units", "").lower()
 
-            # Keep highest reading if multiple reporting areas overlap
-            if key not in result or conc > result[key]:
-                result[key] = conc
+            if key == "no2":
+                val = round(raw_val * _NO2_UGM3_PER_PPB, 2)
+            elif key == "o3":
+                val = round(raw_val * _O3_UGM3_PER_PPB, 2)
+            elif key == "co":
+                val = round(raw_val * _CO_MGM3_PER_PPM, 3)
+            else:
+                val = round(raw_val, 2)   # PM2.5, PM10 already µg/m³
+
+            result[key] = val
 
         return result
 
-    def fetch(self, lat: float, lon: float) -> dict:
-        """
-        Fetch the most recent AQ observations for a GPS location.
-
-        Returns a dict with keys: pm25, pm10, no2, o3, co
-        All values in engine-compatible units (µg/m³ or mg/m³).
-
-        Raises:
-            ValueError   if API key is not set
-            RuntimeError if API call fails
-        """
-        if self.api_key in ("YOUR_AIRNOW_KEY", "", None):
-            raise ValueError(
-                "AirNow API key not set. "
-                "Register free at https://docs.airnowapi.org/"
-            )
-
-        params = urllib.parse.urlencode({
-            "format":        "application/json",
-            "latitude":      lat,
-            "longitude":     lon,
-            "distance":      self.distance_miles,
-            "API_KEY":       self.api_key,
-        })
-        url = f"{self.BASE_URL}?{params}"
-
+    def _post(self, endpoint: str, body: dict) -> dict:
+        """Make a POST request to the Google Air Quality API."""
+        import urllib.request as _req
+        url     = f"{self.BASE_URL}{endpoint}?key={self.api_key}"
+        payload = json.dumps(body).encode("utf-8")
+        request = _req.Request(
+            url,
+            data    = payload,
+            headers = {"Content-Type": "application/json"},
+            method  = "POST",
+        )
         try:
-            with urllib.request.urlopen(url, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
+            with _req.urlopen(request, timeout=15) as resp:
+                return json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
+            body_txt = ""
+            try:
+                body_txt = e.read().decode()
+            except Exception:
+                pass
             if e.code == 400:
                 raise RuntimeError(
-                    f"AirNow API 400 error. URL tried: {url[:120]}... "
-                    "Check that your API key is activated (confirmation email link). "
-                    "Key format should be: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+                    f"Google Air Quality API 400 error. "
+                    f"Check your API key has 'Air Quality API' enabled in Google Cloud Console. "
+                    f"Details: {body_txt[:200]}"
                 )
-            if e.code == 429:
-                raise RuntimeError("AirNow rate limit hit (500 req/hour). Try again shortly.")
-            raise RuntimeError(f"AirNow API error {e.code}: {e.reason}")
+            if e.code == 403:
+                raise RuntimeError(
+                    "Google Air Quality API 403 — key rejected or billing not enabled. "
+                    "Enable billing in Google Cloud Console (free tier covers our usage)."
+                )
+            raise RuntimeError(f"Google Air Quality API error {e.code}: {e.reason} — {body_txt[:200]}")
         except urllib.error.URLError as e:
-            raise RuntimeError(f"Network error reaching AirNow: {e.reason}")
+            raise RuntimeError(f"Network error reaching Google Air Quality API: {e.reason}")
 
-        if not isinstance(data, list) or len(data) == 0:
-            # No stations in range — return empty dict, assembler will flag as missing
-            return {}
+    def fetch(self, lat: float, lon: float) -> dict:
+        """
+        Fetch current hourly AQ for a GPS location.
 
-        return self._parse_observations(data)
+        Returns dict with keys: pm25, pm10, no2, o3, co
+        All values in engine-compatible units (µg/m³ or mg/m³).
+        500×500 m resolution — true micro-level data.
+
+        Raises:
+            ValueError   if API key not set
+            RuntimeError if API call fails
+        """
+        if self.api_key in ("YOUR_GOOGLE_KEY", "", None):
+            raise ValueError(
+                "Google API key not set. "
+                "Enable 'Air Quality API' in Google Cloud Console."
+            )
+
+        body = {
+            "location": {"latitude": lat, "longitude": lon},
+            "extraComputations": ["POLLUTANT_CONCENTRATION"],
+            "languageCode": "en",
+        }
+        data = self._post(self.CURRENT_URL, body)
+
+        pollutants = data.get("pollutants", [])
+        if not pollutants:
+            raise RuntimeError(
+                f"Google Air Quality API returned no pollutant data for "
+                f"lat={lat:.4f}, lon={lon:.4f}. "
+                "Check the location is in a supported country."
+            )
+
+        result = self._parse_pollutants(pollutants)
+        if not result:
+            raise RuntimeError(
+                "Google Air Quality API returned pollutants but none matched "
+                "known keys (pm25, pm10, no2, o3, co)."
+            )
+        return result
 
     def fetch_history(self, lat: float, lon: float,
                       start_ts: int, end_ts: int) -> list:
         """
-        Fetch historical hourly AQ from AirNow for a time range.
+        Fetch historical hourly AQ from Google Air Quality API.
         Used to backfill missed hours when the app was closed.
+        Supports up to 30 days of history.
 
-        Loops one request per hour (AirNow historical endpoint is per-hour).
-        AirNow supports up to 2 months of history.
+        Returns list of dicts: [{timestamp, pm25, pm10, no2, o3, co}, ...]
+        Sorted ascending by timestamp.
         """
-        if self.api_key in ("YOUR_AIRNOW_KEY", "", None):
-            raise ValueError("AirNow API key not set.")
+        if self.api_key in ("YOUR_GOOGLE_KEY", "", None):
+            raise ValueError("Google API key not set.")
+
+        start_dt = datetime.datetime.utcfromtimestamp(start_ts)
+        end_dt   = datetime.datetime.utcfromtimestamp(end_ts)
+
+        body = {
+            "location": {"latitude": lat, "longitude": lon},
+            "period": {
+                "startTime": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "endTime":   end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            "extraComputations": ["POLLUTANT_CONCENTRATION"],
+            "languageCode": "en",
+            "pageSize": 720,   # max hours in 30 days
+        }
 
         results = []
-        ts = start_ts
-        while ts <= end_ts:
-            dt = datetime.datetime.utcfromtimestamp(ts)
-            date_str = dt.strftime("%Y-%m-%dT%H:%M")
-            params = urllib.parse.urlencode({
-                "format":        "application/json",
-                "latitude":      lat,
-                "longitude":     lon,
-                "distance":      self.distance_miles,
-                "date":          date_str,
-                "API_KEY":       self.api_key,
-            })
-            url = f"{self.HISTORY_URL}?{params}"
-            try:
-                with urllib.request.urlopen(url, timeout=15) as resp:
-                    data = json.loads(resp.read().decode())
-                if isinstance(data, list) and len(data) > 0:
-                    pollutants = self._parse_observations(data)
-                    if pollutants:
-                        entry = {"timestamp": ts}
-                        entry.update(pollutants)
-                        results.append(entry)
-            except Exception:
-                pass   # skip failed hours, continue backfill
-            ts += 3600
+        while True:
+            data = self._post(self.HISTORY_URL, body)
+            for hour in data.get("hoursInfo", []):
+                dt_str = hour.get("dateTime", "")
+                try:
+                    dt = datetime.datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%SZ")
+                    ts = int(dt.replace(
+                        tzinfo=datetime.timezone.utc).timestamp())
+                except ValueError:
+                    continue
+                pollutants = hour.get("pollutants", [])
+                parsed = self._parse_pollutants(pollutants)
+                if parsed:
+                    entry = {"timestamp": ts}
+                    entry.update(parsed)
+                    results.append(entry)
 
-        return results
-
-        results = []
-        for utc_str, recs in sorted(by_hour.items()):
-            try:
-                dt = datetime.datetime.strptime(utc_str[:16], "%Y-%m-%dT%H:%M")
-                ts = int(dt.replace(tzinfo=datetime.timezone.utc).timestamp())
-            except ValueError:
-                continue
-            pollutants = self._parse_records(recs)
-            if pollutants:
-                entry = {"timestamp": ts}
-                entry.update(pollutants)
-                results.append(entry)
+            # Handle pagination
+            next_token = data.get("nextPageToken")
+            if not next_token:
+                break
+            body["pageToken"] = next_token
 
         results.sort(key=lambda x: x["timestamp"])
         return results
 
+
+# Keep AirNowClient name as alias for backward compatibility
+AirNowClient = GoogleAirQualityClient
 
 
 
@@ -726,36 +668,29 @@ class PollutantAssembler:
 # 4. Mock client for testing without real API keys
 # ══════════════════════════════════════════════════════════════════════════════
 
-class MockAirNowClient:
+class MockGoogleAQClient:
     """
-    Returns realistic outdoor AQ values without hitting the AirNow API.
-    Values approximate a typical urban US day (comparable to SF Bay Area).
-    All values in engine-compatible units (µg/m³ or mg/m³) — same as AirNowClient.
+    Returns realistic outdoor AQ values without hitting the Google Air Quality API.
+    Values approximate a clean urban day (SF Bay Area level).
+    All values in engine-compatible units (µg/m³ or mg/m³).
 
     Mock values and their real-world equivalents:
         pm25:  8.0 µg/m³    (good — AQI ~33)
         pm10: 18.0 µg/m³    (good)
-        no2:  54.0 µg/m³    (≈28.7 ppb — moderate urban)
+        no2:  54.0 µg/m³    (≈28.7 ppb — moderate urban, matches Apple Weather SF)
         o3:  117.6 µg/m³    (≈60 ppb   — moderate afternoon)
         co:    0.69 mg/m³   (≈0.6 ppm  — clean urban)
-
-    Note: pm25 here is the OUTDOOR value. When indoors, the assembler
-    uses outdoor × 0.50 infiltration factor unless a sensor reading
-    is provided in indoor_overrides["pm25"].
     """
-    # Mock values already in engine units (µg/m³ / mg/m³)
     _BASE = {"pm25": 8.0, "pm10": 18.0, "no2": 54.0, "o3": 117.6, "co": 0.69}
 
     def __init__(self):
-        self.api_key        = "MOCK"
-        self.distance_miles = 50
+        self.api_key = "MOCK"
 
     def fetch(self, lat: float, lon: float) -> dict:
         return dict(self._BASE)
 
     def fetch_history(self, lat: float, lon: float,
                       start_ts: int, end_ts: int) -> list:
-        """Mock historical data — one entry per hour with slight variation."""
         import math
         results = []
         ts = start_ts
@@ -774,8 +709,9 @@ class MockAirNowClient:
             i  += 1
         return results
 
-# Alias so existing code that references MockOWMClient still works
-MockOWMClient = MockAirNowClient
+# Aliases for backward compatibility
+MockAirNowClient = MockGoogleAQClient
+MockOWMClient    = MockGoogleAQClient
 
 
 class MockPollenClient:
