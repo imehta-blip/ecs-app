@@ -238,6 +238,9 @@ def _init_state():
 _init_state()
 
 # ── Timezone: resolve once from browser, persist in session_state ────────────
+# Auto-detect browser timezone via streamlit-js-eval if available.
+# Only runs once (when still UTC) and only if not already set by sidebar selector.
+# The sidebar selectbox is the reliable fallback — user can always override there.
 if _HAS_JS_EVAL and st.session_state.user_tz_str == "UTC":
     try:
         _tz_raw = streamlit_js_eval(
@@ -245,9 +248,9 @@ if _HAS_JS_EVAL and st.session_state.user_tz_str == "UTC":
             key="tz_detect",
         )
         if _tz_raw and isinstance(_tz_raw, str):
-            zoneinfo.ZoneInfo(_tz_raw)          # validate — raises if unknown
+            zoneinfo.ZoneInfo(_tz_raw)   # validate — raises if unknown tz string
             st.session_state.user_tz_str = _tz_raw
-            st.rerun()  # rerun so all time logic uses local tz from start
+            # No st.rerun() here — sidebar selectbox will reflect on next natural rerun
     except Exception:
         pass   # keep UTC
 
@@ -403,13 +406,35 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+    st.markdown("**Timezone**")
+    _common_tzs = [
+        "America/Los_Angeles", "America/Denver", "America/Chicago",
+        "America/New_York", "America/Phoenix", "Pacific/Honolulu",
+        "America/Anchorage", "Europe/London", "Europe/Paris",
+        "Europe/Berlin", "Asia/Dubai", "Asia/Kolkata", "Asia/Singapore",
+        "Asia/Tokyo", "Australia/Sydney", "UTC",
+    ]
+    _cur_tz = st.session_state.user_tz_str
+    if _cur_tz not in _common_tzs:
+        _common_tzs = [_cur_tz] + _common_tzs
+    _selected_tz = st.selectbox(
+        "Your timezone",
+        options=_common_tzs,
+        index=_common_tzs.index(_cur_tz),
+        key="tz_selectbox",
+    )
+    if _selected_tz != st.session_state.user_tz_str:
+        st.session_state.user_tz_str = _selected_tz
+        st.rerun()
+
+    st.divider()
     st.markdown("**Auto-refresh**")
     if _HAS_AUTOREFRESH:
         mins_left = 60 - _now.minute
         st.success(f"✅ Scoring every 60 min automatically")
         st.caption(f"Next refresh in ~{mins_left} min · TZ: {st.session_state.user_tz_str}")
     else:
-        st.warning("⚠ Install `streamlit-autorefresh` to enable auto-scoring.")
+        st.warning("⚠ `streamlit-autorefresh` not installed — hourly auto-scoring disabled.")
     if st.session_state.last_scored:
         st.caption(f"Last scored: {st.session_state.last_scored.strftime('%H:%M:%S')} {st.session_state.user_tz_str}")
 
