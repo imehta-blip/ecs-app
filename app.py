@@ -35,15 +35,30 @@ except ImportError:
     _HAS_AUTOREFRESH = False
 
 # ── Load ECS modules ──────────────────────────────────────────────────────────
-from ecs_engine import (
-    compute_hourly_ECS, close_day, ecs_band,
-    HourlyReading, UserState, WHO_THRESHOLDS,
-)
-from ecs_data_layer import (
-    AirNowClient, GooglePollenClient, PollutantAssembler,
-    MockAirNowClient, MockOWMClient, MockPollenClient, INFILTRATION_FACTORS,
-    LocationZone, INDOOR_ZONES,
-)
+import traceback as _tb
+
+try:
+    from ecs_engine import (
+        compute_hourly_ECS, close_day, ecs_band,
+        HourlyReading, UserState, WHO_THRESHOLDS,
+    )
+except Exception as _e:
+    import streamlit as _st
+    _st.error(f"**ecs_engine import failed:** `{_e}`")
+    _st.code(_tb.format_exc())
+    _st.stop()
+
+try:
+    from ecs_data_layer import (
+        AirNowClient, GooglePollenClient, PollutantAssembler,
+        MockAirNowClient, MockOWMClient, MockPollenClient, INFILTRATION_FACTORS,
+        LocationZone, INDOOR_ZONES,
+    )
+except Exception as _e:
+    import streamlit as _st
+    _st.error(f"**ecs_data_layer import failed:** `{_e}`")
+    _st.code(_tb.format_exc())
+    _st.stop()
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -330,7 +345,7 @@ with st.sidebar:
 
     # Secrets — loaded once; never reset the toggle after first run
     _secrets    = getattr(st, "secrets", {})
-    default_owm    = _secrets.get("AIRNOW_API_KEY", "")
+    default_owm    = _secrets.get("GOOGLE_API_KEY", "")   # same key as Pollen
     default_google = _secrets.get("GOOGLE_API_KEY", "")
 
     # First run: default mock OFF if keys are present in secrets, ON otherwise
@@ -341,6 +356,8 @@ with st.sidebar:
         "Use mock data (no API keys needed)",
         value=st.session_state.use_mock,
     )
+    if not _mock_toggled:
+        st.caption("ℹ️ Google Air Quality API — 500m resolution, global.")
     st.session_state.use_mock = _mock_toggled
     use_mock = _mock_toggled
 
@@ -350,14 +367,14 @@ with st.sidebar:
         # Only show input fields when keys are NOT in secrets.
         if default_owm and default_google:
             st.success("🔑 API keys loaded from Streamlit secrets")
-            owm_key    = default_owm   # AirNow key
+            owm_key    = default_owm   # Google AQ key (same as Pollen)
             google_key = default_google
         else:
-            owm_key    = st.text_input("AirNow API key", value="", type="password",
-                                       placeholder="Paste your AirNow key here")
+            owm_key    = st.text_input("Google Air Quality key", value="", type="password",
+                                       placeholder="Same key as Pollen API")
             google_key = st.text_input("Google Pollen API key",  value="", type="password",
                                        placeholder="Paste your Google key here")
-            if not owm_key or not google_key:  # AirNow key required
+            if not owm_key or not google_key:
                 st.warning("Enter both keys or enable mock mode.")
                 st.session_state.use_mock = True
                 use_mock = True
@@ -377,8 +394,8 @@ with st.sidebar:
             st.info("GPS detecting on load. If denied, enter manually:")
         else:
             st.caption("Install `streamlit-js-eval` for auto GPS.")
-    manual_lat = st.number_input("Lat (manual fallback)",  value=float(st.session_state.gps_lat or 51.5074), format="%.4f", step=0.0001)
-    manual_lon = st.number_input("Lon (manual fallback)", value=float(st.session_state.gps_lon or -0.1278),  format="%.4f", step=0.0001)
+    manual_lat = st.number_input("Lat (manual fallback)",  value=float(st.session_state.gps_lat or 37.7749), format="%.4f", step=0.0001)
+    manual_lon = st.number_input("Lon (manual fallback)", value=float(st.session_state.gps_lon or -122.4194), format="%.4f", step=0.0001)
     if st.button("Use manual coords"):
         st.session_state.gps_lat   = manual_lat
         st.session_state.gps_lon   = manual_lon
@@ -406,7 +423,7 @@ with st.sidebar:
     st.markdown("""
 <small style='color:#555'>
 ECS v1.0 · DALY-weighted<br>
-Data: AirNow EPA + Google Pollen<br>
+Data: Google Air Quality + Google Pollen<br>
 Infiltration: Chen & Zhao 2011
 </small>
 """, unsafe_allow_html=True)
@@ -548,9 +565,9 @@ def _color_for_score(score: float) -> str:
 
 def _get_assembler():
     if use_mock:
-        return PollutantAssembler(owm_client=MockAirNowClient(), pollen_client=MockPollenClient())
+        return PollutantAssembler(owm_client=MockGoogleAQClient(), pollen_client=MockPollenClient())
     return PollutantAssembler(
-        owm_client    = AirNowClient(api_key=owm_key),
+        owm_client    = GoogleAirQualityClient(api_key=owm_key),
         pollen_client = GooglePollenClient(api_key=google_key),
     )
 
@@ -646,7 +663,7 @@ def _score_now(overwrite: bool = False):
 def _backfill_missing_hours():
     """
     Called on app open when hours have been missed (browser was closed).
-    Uses AirNow historical API to fetch AQ for each missed hour and scores them.
+    Uses Google Air Quality API to fetch AQ for each missed hour and scores them.
     Pollen is held constant at today's value (Google Pollen is daily only).
     Silently fills history so user sees a complete picture when they return.
     Only backfills within the current ECS day (07:00 boundary).
@@ -756,7 +773,7 @@ def _backfill_missing_hours():
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Backfill missed hours (silently, before rendering) ───────────────────────
-# If the browser was closed and hours were missed, fetch AirNow historical data
+# If the browser was closed and hours were missed, fetch Google Air Quality historical data
 # and score each missed hour so history is complete when user returns.
 if (st.session_state.last_scored_hour is not None
         and st.session_state.last_scored_hour != _now.hour):
@@ -1057,22 +1074,28 @@ if result is not None:
         # ── Backend inspector ─────────────────────────────────────────────────
         with st.expander("🔬 Backend — raw data & assembly log"):
             st.markdown("**Outdoor API (raw — converted to display units)**")
-            raw_cols = st.columns(len(assembly.outdoor_raw))
-            for i, (k, v) in enumerate(assembly.outdoor_raw.items()):
-                dv, du, dw, _ = _to_display(k, v)
-                raw_cols[i].metric(DISPLAY_NAMES.get(k, k), f"{dv} {du}")
+            if assembly.outdoor_raw:
+                raw_cols = st.columns(len(assembly.outdoor_raw))
+                for i, (k, v) in enumerate(assembly.outdoor_raw.items()):
+                    dv, du, dw, _ = _to_display(k, v)
+                    raw_cols[i].metric(DISPLAY_NAMES.get(k, k), f"{dv} {du}")
+            else:
+                st.warning("⚠ Google Air Quality API returned no data. Check your key has 'Air Quality API' enabled in Google Cloud Console.")
 
             st.markdown("**Pollen API (raw)**")
-            pol_cols = st.columns(len(assembly.pollen_raw))
-            for i, (k, v) in enumerate(assembly.pollen_raw.items()):
-                dv, du, dw, _ = _to_display(k, v)
-                who_str = f"WHO: {dw} {du}" if dw else ""
-                pol_cols[i].metric(
-                    DISPLAY_NAMES.get(k, k),
-                    f"{dv} {du}",
-                    delta=who_str,
-                    delta_color="off",
-                )
+            if assembly.pollen_raw:
+                pol_cols = st.columns(len(assembly.pollen_raw))
+                for i, (k, v) in enumerate(assembly.pollen_raw.items()):
+                    dv, du, dw, _ = _to_display(k, v)
+                    who_str = f"WHO: {dw} {du}" if dw else ""
+                    pol_cols[i].metric(
+                        DISPLAY_NAMES.get(k, k),
+                        f"{dv} {du}",
+                        delta=who_str,
+                        delta_color="off",
+                    )
+            else:
+                st.warning("⚠ Google Pollen returned no data.")
 
             if assembly.source_notes:
                 st.markdown("**Assembly log** — how every number was built")
@@ -1257,7 +1280,7 @@ else:
         st.line_chart(df)
 
     if any(h.get("backfilled") for h in history):
-        st.caption("↩ = backfilled from AirNow historical data while browser was closed")
+        st.caption("↩ = backfilled from Google Air Quality historical data while browser was closed")
 
     # ── Per-hour table — always visible, expandable detail per row ─────────
     DISPLAY_NAMES_SHORT = {
