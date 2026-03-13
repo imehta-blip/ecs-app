@@ -50,9 +50,9 @@ except Exception as _e:
 
 try:
     from ecs_data_layer import (
-        AirNowClient, GooglePollenClient, PollutantAssembler,
-        MockAirNowClient, MockOWMClient, MockPollenClient, INFILTRATION_FACTORS,
-        LocationZone, INDOOR_ZONES,
+        GoogleAirQualityClient, GooglePollenClient, PollutantAssembler,
+        MockGoogleAQClient, MockAirNowClient, MockOWMClient, MockPollenClient,
+        INFILTRATION_FACTORS, LocationZone, INDOOR_ZONES,
     )
 except Exception as _e:
     import streamlit as _st
